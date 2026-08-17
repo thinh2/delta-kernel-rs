@@ -56,6 +56,7 @@ macro_rules! define_sweeps {
         feature_set_values = $fs:tt,
         data_layout_values = $dl:tt,
         table_config_values = $tc:tt,
+        layout_config_values = $lc:tt,
         version_target_values = $vt:tt $(,)?
     ) => {
         #[template]
@@ -64,8 +65,7 @@ macro_rules! define_sweeps {
         pub fn default_sweep(
             #[values $ls] log_state: LogState,
             #[values $fs] feature_set: FeatureSet,
-            #[values $dl] data_layout: DataLayoutConfig,
-            #[values $tc] table_config: TableConfig,
+            #[values $lc] layout_config: (DataLayoutConfig, TableConfig),
             #[values $vt] version_target: VersionTarget,
         ) {
         }
@@ -133,15 +133,35 @@ define_sweeps! {
         checkpoint_struct_stats(),
         no_checkpoint_stats()
     ),
-    // TODO: ICT read assertions (needs pub get_in_commit_timestamp) + AtTimestamp
-    //       VersionTarget (timestamp time travel via history_manager::latest_version_as_of).
+    // Data layout and stats config are bundled into one axis rather than crossed: this
+    // sweep round-trips each pairing with no predicate, so the stats config can't affect
+    // the version or row-count assertions, and crossing the two would add cases without
+    // adding coverage. Skipping behavior is asserted in predicate-bearing unit tests.
+    layout_config_values = (
+        (unpartitioned(), no_checkpoint_stats()),
+        (partitioned(), with_json_stats(num_indexed_cols_zero())),
+        (clustered(), with_struct_stats(num_indexed_cols_zero())),
+        (unpartitioned(), with_json_stats(num_indexed_cols_narrow())),
+        (partitioned(), with_struct_stats(num_indexed_cols_narrow())),
+        (clustered(), with_json_stats(num_indexed_cols_all())),
+        (unpartitioned(), with_struct_stats(num_indexed_cols_all())),
+        (partitioned(), with_json_stats(stats_columns_empty())),
+        (clustered(), with_struct_stats(stats_columns_empty())),
+        (unpartitioned(), with_json_stats(stats_columns_reordered())),
+        (partitioned(), with_struct_stats(stats_columns_reordered()))
+    ),
+    // `version_at_timestamp_max()` is the only timestamp row; see its docs for why
+    // intermediate-version resolution lives in a dedicated test instead.
     version_target_values = (
         version_latest(),
         version_at_mid(),
-        version_incremental_to_latest()
+        version_incremental_from_mid_to_latest(),
+        version_incremental_from_mid_to_pre_latest(),
+        version_at_timestamp_max()
     ),
 }
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
@@ -149,14 +169,17 @@ pub use counting_reporter::{
     CapturingReporter, CountingReporter, RelaxedCounter,
 };
 use delta_kernel::actions::{
-    get_log_add_schema, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+    LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
-    StringArray, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
+    MapBuilder, RecordBatch, StringArray, StringBuilder, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use delta_kernel::arrow::compute::concat;
+use delta_kernel::arrow::datatypes::{
+    DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
+};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::{
@@ -172,11 +195,14 @@ use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{
+    schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType,
+};
+use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
-    try_parse_uri, DeltaResult, DeltaResultIterator, Engine, EngineData, FileMeta,
-    FilteredEngineData, LogPath, Snapshot,
+    try_parse_uri, CancellationToken, CancelledFuture, DeltaResult, DeltaResultIterator, Engine,
+    EngineData, Error, FileMeta, FilteredEngineData, LogPath, Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -344,29 +370,29 @@ pub fn record_batch_to_bytes_with_props(
 
 /// Anything that implements `IntoArray` can turn itself into a reference to an arrow array
 pub trait IntoArray {
-    fn into_array(self) -> ArrayRef;
+    fn into_arrow_array(self) -> ArrayRef;
 }
 
 impl IntoArray for Vec<i32> {
-    fn into_array(self) -> ArrayRef {
+    fn into_arrow_array(self) -> ArrayRef {
         Arc::new(Int32Array::from(self))
     }
 }
 
 impl IntoArray for Vec<i64> {
-    fn into_array(self) -> ArrayRef {
+    fn into_arrow_array(self) -> ArrayRef {
         Arc::new(Int64Array::from(self))
     }
 }
 
 impl IntoArray for Vec<bool> {
-    fn into_array(self) -> ArrayRef {
+    fn into_arrow_array(self) -> ArrayRef {
         Arc::new(BooleanArray::from(self))
     }
 }
 
 impl IntoArray for Vec<&'static str> {
-    fn into_array(self) -> ArrayRef {
+    fn into_arrow_array(self) -> ArrayRef {
         Arc::new(StringArray::from(self))
     }
 }
@@ -385,8 +411,8 @@ where
 /// respectively
 pub fn generate_simple_batch() -> Result<RecordBatch, ArrowError> {
     generate_batch(vec![
-        ("id", vec![1, 2, 3].into_array()),
-        ("val", vec!["a", "b", "c"].into_array()),
+        ("id", vec![1, 2, 3].into_arrow_array()),
+        ("val", vec!["a", "b", "c"].into_arrow_array()),
     ])
 }
 
@@ -487,14 +513,127 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         .into()
 }
 
-/// Helper to create a DefaultEngine with the default executor for tests.
+/// A modification to an add-file batch's `partitionValues` keys.
+#[derive(Clone, Copy)]
+pub enum AddFilePartitionKeyModify<'a> {
+    Drop {
+        key: &'a str,
+    },
+    Insert {
+        key: &'a str,
+        value: Option<&'a str>,
+    },
+}
+
+/// Applies `modifications` in order to every `partitionValues` row in an add-file batch.
 ///
-/// Uses `TokioBackgroundExecutor` as the default executor.
+/// `Drop` removes every entry with the given key. `Insert` appends a new entry.
+///
+/// # Panics
+///
+/// Panics when `batch` does not contain a string-keyed and string-valued `partitionValues` map, or
+/// when the modified batch cannot be constructed.
+pub fn modify_add_file_partition_keys(
+    batch: RecordBatch,
+    modifications: &[AddFilePartitionKeyModify<'_>],
+) -> RecordBatch {
+    if modifications.is_empty() {
+        return batch;
+    }
+
+    let index = batch
+        .schema()
+        .index_of("partitionValues")
+        .expect("partitionValues field in add-file batch");
+    let map = batch.column(index).as_map();
+    let (entry_field, ordered) = match map.data_type() {
+        ArrowDataType::Map(entry_field, ordered) => (entry_field.clone(), *ordered),
+        _ => unreachable!("partitionValues column must be a map"),
+    };
+    let (key_field, value_field) = map.entries_fields();
+    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new())
+        .with_keys_field(key_field.clone())
+        .with_values_field(value_field.clone());
+    for row in 0..map.len() {
+        let entries = map.value(row);
+        let keys = entries.column(0).as_string::<i32>();
+        let values = entries.column(1).as_string::<i32>();
+        let mut partition_values: Vec<(&str, Option<&str>)> = (0..keys.len())
+            .map(|i| (keys.value(i), values.is_valid(i).then(|| values.value(i))))
+            .collect();
+        for modification in modifications {
+            match *modification {
+                AddFilePartitionKeyModify::Drop { key } => {
+                    partition_values.retain(|(existing_key, _)| *existing_key != key);
+                }
+                AddFilePartitionKeyModify::Insert { key, value } => {
+                    partition_values.push((key, value));
+                }
+            }
+        }
+        for (key, value) in partition_values {
+            builder.keys().append_value(key);
+            match value {
+                Some(value) => builder.values().append_value(value),
+                None => builder.values().append_null(),
+            }
+        }
+        builder
+            .append(true)
+            .expect("failed to append partition-values map row");
+    }
+    let (_, offsets, entries, nulls, _) = builder.finish().into_parts();
+    let new_map: ArrayRef = Arc::new(
+        MapArray::try_new(entry_field, offsets, entries, nulls, ordered)
+            .expect("failed to rebuild partition-values map"),
+    );
+
+    let mut columns = batch.columns().to_vec();
+    columns[index] = new_map;
+    RecordBatch::try_new(batch.schema(), columns)
+        .expect("failed to rebuild add-file batch after modifying a partition key")
+}
+
+/// Replaces one row in an Arrow array with a one-row array of the same type.
+///
+/// # Panics
+///
+/// Panics if `replacement` does not contain exactly one row, `row` is out of bounds, or the arrays
+/// cannot be concatenated.
+pub fn replace_array_row(column: &ArrayRef, replacement: ArrayRef, row: usize) -> ArrayRef {
+    assert_eq!(
+        replacement.len(),
+        1,
+        "replacement must contain exactly one row"
+    );
+    let slices = [
+        column.slice(0, row),
+        replacement,
+        column.slice(row + 1, column.len() - row - 1),
+    ];
+    let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
+    concat(&arrays).expect("replacement value must match the modified column type")
+}
+
 pub fn create_default_engine(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
+    create_default_engine_with_batch(table_root, None)
+}
+
+/// Helper to create a DefaultEngine with the default executor for tests.
+///
+/// Uses `TokioBackgroundExecutor` as the default executor.
+pub fn create_default_engine_with_batch(
+    table_root: &url::Url,
+    batch_size: Option<usize>,
+) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
     let store = store_from_url(table_root)?;
-    Ok(Arc::new(DefaultEngineBuilder::new(store).build()))
+    let mut builder = DefaultEngineBuilder::new(store);
+    if let Some(batch_size) = batch_size {
+        builder = builder.with_batch_size(NonZero::new(batch_size).unwrap());
+    }
+    Ok(Arc::new(builder.build()))
 }
 
 /// Helper to create a DefaultEngine with the default executor for tests.
@@ -589,6 +728,10 @@ pub fn engine_store_setup(
     (storage, engine, url)
 }
 
+/// Fixed in-commit timestamp (milliseconds since the Unix epoch) written by [`create_table`] when
+/// the `inCommitTimestamp` writer feature is enabled.
+pub const TEST_ICT_ENABLEMENT_TIMESTAMP: i64 = 1612345678;
+
 // we provide this table creation function since we only do appends to existing tables for now.
 // this will just create an empty table with the given schema. (just protocol + metadata actions)
 // For property-gated writer features, this helper also writes the corresponding enablement
@@ -600,10 +743,36 @@ pub async fn create_table(
     schema: SchemaRef,
     partition_columns: &[&str],
     use_37_protocol: bool,
-    reader_features: Vec<&str>,
-    writer_features: Vec<&str>,
+    mut reader_features: Vec<&str>,
+    mut writer_features: Vec<&str>,
 ) -> Result<Url, Box<dyn std::error::Error>> {
     let table_id = "test_id";
+
+    // IcebergCompatV3 requires ColumnMapping, RowTracking, and DomainMetadata. Add them so callers
+    // can pass just `icebergCompatV3` (plus e.g. `allowColumnDefaults`) and get a loadable table.
+    let enable_iceberg_compat_v3 = writer_features.contains(&"icebergCompatV3");
+    if enable_iceberg_compat_v3 {
+        if !reader_features.contains(&"columnMapping") {
+            reader_features.push("columnMapping");
+        }
+        for f in ["columnMapping", "rowTracking", "domainMetadata"] {
+            if !writer_features.contains(&f) {
+                writer_features.push(f);
+            }
+        }
+    }
+
+    // Column mapping requires per-field `id`/`physicalName` metadata, without which snapshot load
+    // fails. Assign it here (with nested ids for iceberg v3); `max_column_id` feeds
+    // `delta.columnMapping.maxColumnId` below.
+    let (schema, max_column_id) = if reader_features.contains(&"columnMapping") {
+        let mut max_id = find_max_column_id_in_schema(&schema).unwrap_or(0);
+        let schema =
+            assign_column_mapping_metadata(&schema, &mut max_id, enable_iceberg_compat_v3)?;
+        (Arc::new(schema), max_id)
+    } else {
+        (schema, 0i64)
+    };
     let schema = serde_json::to_string(&schema)?;
 
     let protocol = if use_37_protocol {
@@ -629,6 +798,13 @@ pub async fn create_table(
 
         if reader_features.contains(&"columnMapping") {
             config.insert("delta.columnMapping.mode".to_string(), json!("name"));
+            config.insert(
+                "delta.columnMapping.maxColumnId".to_string(),
+                json!(max_column_id.to_string()),
+            );
+        }
+        if writer_features.contains(&"icebergCompatV3") {
+            config.insert("delta.enableIcebergCompatV3".to_string(), json!("true"));
         }
         if writer_features.contains(&"rowTracking") {
             config.insert("delta.enableRowTracking".to_string(), json!("true"));
@@ -649,7 +825,7 @@ pub async fn create_table(
             );
             config.insert(
                 "delta.inCommitTimestampEnablementTimestamp".to_string(),
-                json!("1612345678"),
+                json!(TEST_ICT_ENABLEMENT_TIMESTAMP.to_string()),
             );
         }
         if writer_features.contains(&"changeDataFeed") {
@@ -682,7 +858,7 @@ pub async fn create_table(
     // Add commitInfo with ICT if ICT is enabled
     let commit_info = if writer_features.contains(&"inCommitTimestamp") {
         // When ICT is enabled from version 0, we need to include it in the initial commit
-        let timestamp = 1612345678i64; // Use a fixed timestamp for testing
+        let timestamp = TEST_ICT_ENABLEMENT_TIMESTAMP;
         Some(json!({
             "commitInfo": {
                 "timestamp": timestamp,
@@ -723,6 +899,88 @@ pub async fn create_table(
     Ok(table_path)
 }
 
+/// Returns a copy of `schema` with `CURRENT_DEFAULT` metadata attached to the named top-level
+/// fields.
+///
+/// `column_defaults` maps `column_name -> default_sql`. The raw SQL is stored verbatim; this
+/// helper does not parse or validate it.
+///
+/// # Errors
+///
+/// Returns an error if `column_defaults` names a column that is not a top-level field of `schema`.
+pub fn schema_with_column_defaults(
+    schema: &StructType,
+    mut column_defaults: HashMap<&str, &str>,
+) -> DeltaResult<SchemaRef> {
+    let augmented_fields: Vec<_> = schema
+        .fields()
+        .map(|field| match column_defaults.remove(field.name.as_str()) {
+            Some(sql) => field.clone().add_metadata([(
+                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+                MetadataValue::String(sql.to_string()),
+            )]),
+            None => field.clone(),
+        })
+        .collect();
+    if !column_defaults.is_empty() {
+        return Err(Error::generic(format!(
+            "column defaults reference unknown top-level columns: {:?}",
+            column_defaults.into_keys().collect::<Vec<_>>()
+        )));
+    }
+
+    Ok(Arc::new(StructType::try_new(augmented_fields)?))
+}
+
+/// Creates an empty test table using protocol version (3, 7).
+///
+/// # Parameters
+///
+/// - `schema`: The table schema.
+/// - `partition_columns`: The table's partition columns.
+/// - `local_directory`: The local table directory, or `None` for an in-memory table.
+/// - `table_base_name`: The table name prefix.
+///
+/// # Returns
+///
+/// The table URL, engine, object store, and table label.
+///
+/// # Errors
+///
+/// Returns an error if the table cannot be created.
+pub async fn setup_test_table_p37(
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    local_directory: Option<&Url>,
+    table_base_name: &str,
+) -> Result<
+    (
+        Url,
+        DefaultEngine<TokioBackgroundExecutor>,
+        Arc<DynObjectStore>,
+        &'static str,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let table_name = format!("{table_base_name}_37");
+    let (store, engine, table_location) = engine_store_setup(table_name.as_str(), local_directory);
+    Ok((
+        create_table(
+            store.clone(),
+            table_location,
+            schema,
+            partition_columns,
+            true,
+            vec![],
+            vec![],
+        )
+        .await?,
+        engine,
+        store,
+        "test_table_37",
+    ))
+}
+
 /// Creates two empty test tables, one with 37 protocol and one with 11 protocol.  the tables will
 /// be named {table_base_name}_11 and {table_base_name}_37. The local_directory param can be set to
 /// write out the tables to the local filesystem, passing in None will create in-memory tables
@@ -741,27 +999,17 @@ pub async fn setup_test_tables(
     Box<dyn std::error::Error>,
 > {
     let table_name_11 = format!("{table_base_name}_11");
-    let table_name_37 = format!("{table_base_name}_37");
     let (store_11, engine_11, table_location_11) =
         engine_store_setup(table_name_11.as_str(), local_directory);
-    let (store_37, engine_37, table_location_37) =
-        engine_store_setup(table_name_37.as_str(), local_directory);
+    let table_37 = setup_test_table_p37(
+        schema.clone(),
+        partition_columns,
+        local_directory,
+        table_base_name,
+    )
+    .await?;
     Ok(vec![
-        (
-            create_table(
-                store_37.clone(),
-                table_location_37,
-                schema.clone(),
-                partition_columns,
-                true,
-                vec![],
-                vec![],
-            )
-            .await?,
-            engine_37,
-            store_37,
-            "test_table_37",
-        ),
+        table_37,
         (
             create_table(
                 store_11.clone(),
@@ -856,6 +1104,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
         .transaction(committer, engine.as_ref())?
         .with_operation(operation.to_string())
         .with_data_change(data_change);
+    txn.ack_column_defaults();
     if is_blind_append {
         txn = txn.with_blind_append();
     }
@@ -886,11 +1135,12 @@ impl Committer for TestCatalogCommitter {
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         let path = commit_metadata.published_commit_path()?;
-        engine
-            .json_handler()
-            .write_json_file(&path, Box::new(actions), false)?;
+        let written_size =
+            engine
+                .json_handler()
+                .write_json_file(&path, Box::new(actions), false)?;
         Ok(CommitResponse::Committed {
-            file_meta: FileMeta::new(path, commit_metadata.in_commit_timestamp(), 0),
+            file_meta: FileMeta::new(path, commit_metadata.in_commit_timestamp(), written_size),
         })
     }
 
@@ -934,20 +1184,17 @@ pub fn set_json_value(
 /// `[row_number: long, name: string, score: double, address: {street: string, city: string}, tag:
 /// string, value: int]`
 pub fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
-    Ok(Arc::new(StructType::try_new(vec![
-        StructField::nullable("row_number", DataType::LONG),
-        StructField::nullable("name", DataType::STRING),
-        StructField::nullable("score", DataType::DOUBLE),
-        StructField::nullable(
-            "address",
-            StructType::try_new(vec![
-                StructField::nullable("street", DataType::STRING),
-                StructField::nullable("city", DataType::STRING),
-            ])?,
-        ),
-        StructField::nullable("tag", DataType::STRING),
-        StructField::nullable("value", DataType::INTEGER),
-    ])?))
+    Ok(schema_ref! {
+        nullable "row_number": LONG,
+        nullable "name": STRING,
+        nullable "score": DOUBLE,
+        nullable "address": {
+            nullable "street": STRING,
+            nullable "city": STRING,
+        },
+        nullable "tag": STRING,
+        nullable "value": INTEGER,
+    })
 }
 
 /// Returns two [`RecordBatch`]es with hardcoded test data matching [`nested_schema`].
@@ -1019,32 +1266,30 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
 
 /// Schema with one column of the given type: `(id INT, col <dtype>)`.
 pub fn schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("col", dtype, true),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "col": (dtype),
+    }
 }
 
 /// Schema with the given type nested inside a struct:
 /// `(id INT, nested STRUCT<inner <dtype>>)`.
 pub fn nested_schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new(
-            "nested",
-            StructType::new_unchecked(vec![StructField::new("inner", dtype, true)]),
-            true,
-        ),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "nested": {
+            nullable "inner": (dtype),
+        },
+    }
 }
 
 /// Schema with two columns of the given type: `(id INT, col1 <dtype>, col2 <dtype>)`.
 pub fn multi_schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("col1", dtype.clone(), true),
-        StructField::new("col2", dtype, true),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "col1": (dtype.clone()),
+        nullable "col2": (dtype),
+    }
 }
 
 pub fn top_level_ntz_schema() -> SchemaRef {
@@ -1128,6 +1373,33 @@ pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, messa
             );
         }
     }
+}
+
+/// Collect `row_id` values from scan batches produced with a `MetadataColumnSpec::RowId` schema.
+pub fn collect_row_ids(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name("row_id")
+                .expect("row_id column not found in batch")
+                .as_primitive::<Int64Type>()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// Assert every `row_id` across the batches is unique.
+pub fn assert_row_ids_unique(batches: &[RecordBatch]) {
+    let row_ids = collect_row_ids(batches);
+    let unique: HashSet<i64> = row_ids.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        row_ids.len(),
+        "row IDs must be globally unique: found {} duplicate(s) among {} row(s)",
+        row_ids.len() - unique.len(),
+        row_ids.len(),
+    );
 }
 
 /// Creates add file metadata for one or more files without partition values.
@@ -1249,6 +1521,7 @@ pub async fn write_batch_to_table(
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
+    txn.ack_column_defaults();
     let write_context = if txn.logical_partition_columns().is_empty() {
         assert!(
             partition_values.is_empty(),
@@ -1277,6 +1550,56 @@ pub struct AddInfo {
     pub stats: Option<serde_json::Value>,
 }
 
+/// A [`CancellationToken`] for tests. Start uncancelled and flip it with
+/// [`cancel`](Self::cancel), or construct one already cancelled with
+/// [`cancelled`](Self::cancelled).
+///
+/// The [`cancelled_future`](CancellationToken::cancelled_future) future is backed by a
+/// [`tokio::sync::Notify`] so it resolves when [`cancel`](Self::cancel) fires even from another
+/// thread -- this drives the default engine's mid-read cancellation race, not just the synchronous
+/// `is_cancelled` poll.
+#[derive(Debug, Default)]
+pub struct TestCancellationToken {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl TestCancellationToken {
+    /// A token that is already cancelled.
+    pub fn cancelled() -> Self {
+        let token = Self::default();
+        token.cancel();
+        token
+    }
+
+    /// Request cancellation, waking any future returned by
+    /// [`cancelled_future`](CancellationToken::cancelled_future).
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+}
+
+impl CancellationToken for TestCancellationToken {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn cancelled_future(&self) -> CancelledFuture<'_> {
+        Box::pin(async move {
+            // `notified()` must be registered before the cancellation check to avoid missing a
+            // `notify_waiters` that races between the two; an already-cancelled token still
+            // returns immediately via the check.
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        })
+    }
+}
+
 /// Reads all [`AddInfo`]s from a snapshot's log segment.
 ///
 /// # Example (conceptual)
@@ -1293,7 +1616,7 @@ pub fn read_add_infos(
     snapshot: &Snapshot,
     engine: &impl Engine,
 ) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
-    let schema = get_log_add_schema().clone();
+    let schema = LOG_ADD_SCHEMA.clone();
     let batches = snapshot.log_segment().read_actions(engine, schema)?;
     let mut actions = Vec::new();
     for batch_result in batches {
@@ -1468,6 +1791,35 @@ pub fn get_materialized_row_tracking_column_names(
             .as_str()
             .map(str::to_owned),
     })
+}
+
+/// Reads the `metaData.configuration` map from commit `version` directly through a
+/// [`DynObjectStore`]. Works with any backing store (`file://`, `memory://`, etc.) since
+/// it bypasses [`read_actions_from_commit`]'s `to_file_path()` requirement.
+///
+/// Returns an empty map when the commit contains no `metaData` action, or when the
+/// action has an empty/absent `configuration` field. Errors if any configuration value is
+/// not a string (the spec requires all configuration entries to be strings).
+/// Propagates object-store errors when the commit file is missing or unreadable.
+pub async fn read_metadata_configuration_from_store(
+    store: &DynObjectStore,
+    version: u64,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    let path =
+        delta_kernel::object_store::path::Path::from(format!("_delta_log/{version:020}.json"));
+    let get_result = store.get(&path).await?;
+    let bytes = get_result.bytes().await?;
+    let mut config = HashMap::new();
+    for line in std::str::from_utf8(&bytes)?.lines() {
+        let v: serde_json::Value = serde_json::from_str(line)?;
+        if let Some(c) = v.get("metaData").and_then(|m| m.get("configuration")) {
+            if c.is_object() {
+                let entries: HashMap<String, String> = serde_json::from_value(c.clone())?;
+                config.extend(entries);
+            }
+        }
+    }
+    Ok(config)
 }
 
 /// Removes all scan files from the snapshot, commits the transaction, and returns

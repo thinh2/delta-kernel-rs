@@ -23,6 +23,14 @@ pub enum Operation {
     QueryPlan(Plan),
 }
 
+impl Operation {
+    /// Serializes this [`Operation`] into its proto wire representation.
+    pub fn to_proto_bytes(&self) -> Vec<u8> {
+        use prost::Message as _;
+        crate::plans::proto::operation::Operation::from(self).encode_to_vec()
+    }
+}
+
 /// A singular I/O operation that returns typed data such as raw bytes or file metadata.
 ///
 /// Each variant describes an operation and its parameters. The shape of the result it produces
@@ -71,6 +79,9 @@ pub enum IoOperation {
     /// [`PlanResult::ParquetFooter`]: crate::plans::PlanResult::ParquetFooter
     /// [`ParquetHandler::read_parquet_footer`]: crate::ParquetHandler::read_parquet_footer
     ParquetFooter { file: FileMeta },
+    // TODO(#2820): add a `Delete { url: Url }` variant (plus an `IoOperation::delete`
+    // constructor) so `PlanBasedStorageHandler::delete` can route through the plan path
+    // instead of `unimplemented!()`.
 }
 
 impl IoOperation {

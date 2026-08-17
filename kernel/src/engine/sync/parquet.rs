@@ -3,27 +3,22 @@ use std::sync::Arc;
 use bytes::Bytes;
 use url::Url;
 
-use super::{get_bytes, put_bytes, read_files};
+use super::{get_bytes, put_bytes, read_files_arrow};
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
-    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
-    RowIndexBuilder,
+    fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, RowIndexBuilder,
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::{reader_options, writer_options};
 use crate::object_store::DynObjectStore;
-// `ObjectStoreExt` is needed for `store.get()` etc. in arrow-58 mode where these methods moved
-// off the `ObjectStore` trait. In arrow-57 mode the compat shim makes the import a no-op, so
-// silence the resulting unused-import warning.
-#[allow(unused_imports)]
-use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
+use crate::utils::FoldWithOption as _;
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
-    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
+    ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 pub(crate) struct SyncParquetHandler {
@@ -36,27 +31,23 @@ impl SyncParquetHandler {
     }
 }
 
-fn try_create_from_parquet(
+pub(super) fn try_create_from_parquet(
     data: Bytes,
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    let reader_options = reader_options();
-    let metadata = ArrowReaderMetadata::load(&data, reader_options.clone())?;
-    let parquet_schema = metadata.schema();
-    let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(data, reader_options)?;
-    let (indices, requested_ordering) = get_requested_indices(&schema, parquet_schema)?;
-    if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indices) {
-        builder = builder.with_projection(mask);
-    }
+    let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
+    let (requested_ordering, mask) = parquet_read_plan(&schema, &metadata)?;
 
     let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
-        .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
+        .then(|| RowIndexBuilder::new(metadata.metadata().row_groups()));
 
-    if let Some(predicate) = predicate {
-        builder = builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut());
-    }
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(data, metadata)
+        .fold_with(mask, ParquetRecordBatchReaderBuilder::with_projection)
+        .fold_with(predicate, |builder, predicate| {
+            builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut())
+        });
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.build()?;
@@ -78,13 +69,14 @@ impl ParquetHandler for SyncParquetHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        read_files(
+        let iter = read_files_arrow(
             self.store.as_ref(),
             files,
             schema,
             predicate,
             try_create_from_parquet,
-        )
+        );
+        Ok(Box::new(iter.map(|data| Ok(Box::new(data?) as _))))
     }
 
     /// Writes engine data to a Parquet file at the specified location.
@@ -126,13 +118,19 @@ impl ParquetHandler for SyncParquetHandler {
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
-        let data = get_bytes(self.store.as_ref(), &file.location)?;
-        let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
-        let schema = StructType::try_from_arrow(metadata.schema().as_ref())
-            .map(Arc::new)
-            .map_err(Error::Arrow)?;
-        Ok(ParquetFooter { schema })
+        parquet_footer(self.store.as_ref(), file)
     }
+}
+
+/// Read the [`ParquetFooter`] (schema) of `file`.
+pub(super) fn parquet_footer(
+    store: Option<&Arc<DynObjectStore>>,
+    file: &FileMeta,
+) -> DeltaResult<ParquetFooter> {
+    let data = get_bytes(store, &file.location)?;
+    let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
+    let schema = Arc::new(StructType::try_from_arrow(metadata.schema().as_ref())?);
+    Ok(ParquetFooter { schema })
 }
 
 #[cfg(test)]

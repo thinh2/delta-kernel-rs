@@ -6,12 +6,16 @@ pub use column_mapping::ColumnMappingMode;
 #[internal_api]
 pub(crate) use column_mapping::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 pub(crate) use column_mapping::{
-    column_mapping_mode, get_column_mapping_mode_from_properties, physical_to_logical_column_name,
-    try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
-    validate_column_mapping_id,
+    column_mapping_mode, get_column_mapping_mode_from_properties,
+    physical_to_logical_column_name_and_type, schema_has_column_mapping_metadata,
+    strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
+    validate_and_extract_column_mapping_annotations, validate_column_mapping_id,
+    StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
-pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
+#[cfg(feature = "geo-type-in-dev")]
+pub(crate) use geospatial::validate_geospatial_feature_support;
+pub(crate) use iceberg_compat::v3::{iceberg_compat_v3_column_defaults_validation, V3_VALIDATOR};
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -29,6 +33,8 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 mod column_mapping;
+#[cfg(feature = "geo-type-in-dev")]
+mod geospatial;
 mod iceberg_compat;
 mod timestamp_ntz;
 
@@ -68,7 +74,7 @@ pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
 /// - **WriterOnly** (applies only to writers).
 /// There are no ReaderOnly features. See `TableFeature::feature_type` for the category of each.
 ///
-/// The kernel currently supports all reader features except `V2Checkpoint`.
+/// The kernel currently supports all reader features.
 #[derive(
     Serialize,
     Deserialize,
@@ -82,11 +88,7 @@ pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
     EnumCount,
     Hash,
 )]
-#[strum(
-    serialize_all = "camelCase",
-    parse_err_fn = xxx__not_needed__default_variant_means_parsing_is_infallible__xxx,
-    parse_err_ty = Infallible // ignored, sadly: https://github.com/Peternator7/strum/issues/430
-)]
+#[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 #[derive(EnumIter)]
@@ -128,9 +130,6 @@ pub(crate) enum TableFeature {
     /// Materialize partition columns in parquet data files.
     MaterializePartitionColumns,
     /// Column Default Values.
-    ///
-    /// TODO(#2630): column-defaults is not fully supported yet. Kernel support is gated by
-    /// the `column-defaults-in-dev` cargo feature.
     AllowColumnDefaults,
 
     ///////////////////////////
@@ -146,9 +145,14 @@ pub(crate) enum TableFeature {
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
     DeletionVectors,
-    /// timestamps without timezone support
-    #[strum(serialize = "timestampNtz")]
-    #[serde(rename = "timestampNtz")]
+    /// Timestamps without timezone support. The canonical protocol feature name is `timestampNtz`.
+    ///
+    /// `timestampWithoutTimezone` is not a Delta protocol feature name, but some existing tables
+    /// carry it in their reader/writer feature arrays. Kernel accepts it on read for compatibility
+    /// with those tables and always writes the canonical `timestampNtz`. See
+    /// <https://github.com/delta-io/delta-kernel-rs/issues/2557>.
+    #[strum(to_string = "timestampNtz", serialize = "timestampWithoutTimezone")]
+    #[serde(rename = "timestampNtz", alias = "timestampWithoutTimezone")]
     TimestampWithoutTimezone,
     // Allow columns to change type
     TypeWidening,
@@ -169,6 +173,16 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "variantShredding-preview")]
     #[serde(rename = "variantShredding-preview")]
     VariantShreddingPreview,
+    /// Iceberg V4 adaptive metadata tree as the table's native content metadata format.
+    ///
+    /// TODO(#2866): gated by the `adaptive-metadata-in-dev` cargo feature until fully supported.
+    #[strum(serialize = "adaptiveMetadata-preview")]
+    #[serde(rename = "adaptiveMetadata-preview")]
+    AdaptiveMetadataPreview,
+    /// Geospatial type support (geometry and geography columns)
+    #[strum(serialize = "geospatial")]
+    #[serde(rename = "geospatial")]
+    GeospatialType,
 
     #[serde(untagged)]
     #[strum(default)]
@@ -249,10 +263,7 @@ pub(crate) enum FeatureRequirement {
     NotSupported(TableFeature),
     /// Feature must NOT be enabled (may be supported but property must not activate it)
     NotEnabled(TableFeature),
-    /// Custom validation logic. Currently unused, but already integrated into the
-    /// validation pipeline(`TableConfiguration::validate_feature_requirements`), so kept for
-    /// future use.
-    #[allow(dead_code)]
+    /// Custom validation logic run against the protocol and table properties.
     Custom(fn(&Protocol, &TableProperties) -> DeltaResult<()>),
 }
 
@@ -441,7 +452,6 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 /// Attention in the future:
 /// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3
 ///   tables.
-/// - Column defaults: when supported, only literal expressions are allowed.
 /// - REPLACE TABLE: when supported, partition columns must not change across the replace.
 /// - Timestamp parquet encoding: when kernel can write INT96 or INT64, IcebergCompatV3 tables must
 ///   always use INT64; INT96 is forbidden.
@@ -487,15 +497,11 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// TODO(#2630): drop the gate once column-defaults is fully supported.
 static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[],
-    #[cfg(feature = "column-defaults-in-dev")]
     kernel_support: KernelSupport::Supported,
-    #[cfg(not(feature = "column-defaults-in-dev"))]
-    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -637,6 +643,52 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// Dependencies per the adaptiveMetadata RFC (delta-io/delta#6978) "Table Feature Enablement"
+// section. Enforcement is covered by `test_adaptive_metadata_feature_requirements`.
+// TODO(#2866): drop the `adaptive-metadata-in-dev` gate once adaptiveMetadata is fully supported.
+static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[
+        FeatureRequirement::Enabled(TableFeature::ColumnMapping),
+        FeatureRequirement::Custom(|_protocol, properties| {
+            require!(
+                properties.column_mapping_mode == Some(ColumnMappingMode::Id),
+                Error::invalid_protocol(
+                    "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode"
+                )
+            );
+            Ok(())
+        }),
+        FeatureRequirement::Enabled(TableFeature::RowTracking),
+        FeatureRequirement::Enabled(TableFeature::DomainMetadata),
+        FeatureRequirement::Enabled(TableFeature::DeletionVectors),
+        FeatureRequirement::Enabled(TableFeature::InCommitTimestamp),
+    ],
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+// TODO(#2949): drop the `geo-type-in-dev` gate once full geospatial support ships.
+static GEOSPATIAL_TYPE_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    #[cfg(feature = "geo-type-in-dev")]
+    kernel_support: KernelSupport::Custom(|_, _, op| match op {
+        Operation::Scan | Operation::Cdf => Ok(()),
+        Operation::Write => Err(Error::unsupported(
+            "Feature 'geospatial' is not supported for writes",
+        )),
+    }),
+    #[cfg(not(feature = "geo-type-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 /// By definition, kernel cannot know how to handle unknown features and must assume they're always
 /// enabled if supported in protocol. However, the read path ignores all writer-only features,
 /// including unknown ones. Unknown features are never inferred from legacy protocol versions.
@@ -668,7 +720,9 @@ impl TableFeature {
             | TableFeature::VariantType
             | TableFeature::VariantTypePreview
             | TableFeature::VariantShredding
-            | TableFeature::VariantShreddingPreview => FeatureType::ReaderWriter,
+            | TableFeature::VariantShreddingPreview
+            | TableFeature::AdaptiveMetadataPreview
+            | TableFeature::GeospatialType => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
             | TableFeature::DomainMetadata
             | TableFeature::Invariants
@@ -735,6 +789,8 @@ impl TableFeature {
             TableFeature::VariantTypePreview => &VARIANT_TYPE_PREVIEW_INFO,
             TableFeature::VariantShredding => &VARIANT_SHREDDING_INFO,
             TableFeature::VariantShreddingPreview => &VARIANT_SHREDDING_PREVIEW_INFO,
+            TableFeature::AdaptiveMetadataPreview => &ADAPTIVE_METADATA_PREVIEW_INFO,
+            TableFeature::GeospatialType => &GEOSPATIAL_TYPE_INFO,
 
             // Unknown features: not supported by kernel, no legacy version inference.
             TableFeature::Unknown(_) => &UNKNOWN_FEATURE_INFO,
@@ -761,38 +817,15 @@ impl TableFeature {
     }
 }
 
-/// Like `Into<TableFeature>`, but avoids collisions between strum's derived `EnumString` and the
-/// blanket impl `TryFrom<&str>` that `From<&str> for TableFeature` would trigger.
-///
-/// Parsing is infallible: the `Unknown` default variant catches any unrecognized feature name. If
-/// https://github.com/Peternator7/strum/pull/432 merges, use impl From for TableFeature instead.
-pub(crate) trait IntoTableFeature {
-    fn into_table_feature(self) -> TableFeature;
-}
-
-impl IntoTableFeature for TableFeature {
-    fn into_table_feature(self) -> TableFeature {
-        self
+impl From<String> for TableFeature {
+    fn from(value: String) -> Self {
+        value.as_str().into()
     }
 }
 
-impl IntoTableFeature for &TableFeature {
-    fn into_table_feature(self) -> TableFeature {
-        self.clone()
-    }
-}
-
-/// Parsing is infallible thanks to `TableFeature::Unknown` default variant
-impl IntoTableFeature for &str {
-    fn into_table_feature(self) -> TableFeature {
-        #[allow(clippy::unwrap_used)] // infallible, see strum parse_err_fn
-        self.parse().unwrap()
-    }
-}
-
-impl IntoTableFeature for String {
-    fn into_table_feature(self) -> TableFeature {
-        self.as_str().into_table_feature()
+impl From<&TableFeature> for TableFeature {
+    fn from(value: &TableFeature) -> Self {
+        value.clone()
     }
 }
 
@@ -816,6 +849,56 @@ pub(crate) fn extract_enabled_reader_features(protocol: &Protocol) -> Vec<TableF
             .cloned()
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Add `feature` to the appropriate feature list(s) for its type, skipping duplicates.
+pub(crate) fn add_feature_to_lists(
+    feature: TableFeature,
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    match feature.feature_type() {
+        FeatureType::ReaderWriter => {
+            if !reader_features.contains(&feature) {
+                reader_features.push(feature.clone());
+            }
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature);
+            }
+        }
+        FeatureType::WriterOnly | FeatureType::Unknown => {
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature);
+            }
+        }
+    }
+}
+
+/// Enable each `allowed_table_features` entry whose [`EnablementCheck::EnabledIf`] check is
+/// satisfied by `table_properties`, appending it to `reader_features`/`writer_features`
+/// (deduplicated). Features with [`EnablementCheck::AlwaysIfSupported`] are skipped since they need
+/// no property-driven enablement. `RowTracking` additionally pulls in its `DomainMetadata`
+/// dependency.
+pub(crate) fn auto_enable_property_driven_features(
+    allowed_table_features: &[TableFeature],
+    table_properties: &TableProperties,
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    for table_feature in allowed_table_features {
+        if let EnablementCheck::EnabledIf(check) = table_feature.info().enablement_check {
+            if check(table_properties) {
+                add_feature_to_lists(table_feature.clone(), reader_features, writer_features);
+                if *table_feature == TableFeature::RowTracking {
+                    add_feature_to_lists(
+                        TableFeature::DomainMetadata,
+                        reader_features,
+                        writer_features,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -948,6 +1031,30 @@ mod tests {
         .unwrap(),
         ExpectRead::Ok
     )]
+    // adaptiveMetadata-preview is gated by the `adaptive-metadata-in-dev` cargo feature: readable
+    // only when the flag is on, otherwise rejected as unsupported.
+    #[cfg_attr(
+        feature = "adaptive-metadata-in-dev",
+        case::adaptive_metadata_supported(
+            Protocol::try_new_modern(
+                [TableFeature::AdaptiveMetadataPreview],
+                [TableFeature::AdaptiveMetadataPreview],
+            )
+            .unwrap(),
+            ExpectRead::Ok
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "adaptive-metadata-in-dev"),
+        case::adaptive_metadata_gated_off(
+            Protocol::try_new_modern(
+                [TableFeature::AdaptiveMetadataPreview],
+                [TableFeature::AdaptiveMetadataPreview],
+            )
+            .unwrap(),
+            ExpectRead::Unsupported
+        )
+    )]
     fn validate_protocol_for_read(#[case] protocol: Protocol, #[case] expected: ExpectRead) {
         let result = ensure_table_can_be_read(&protocol);
         match expected {
@@ -961,6 +1068,40 @@ mod tests {
                 "expected Unsupported, got: {result:?}"
             ),
         }
+    }
+
+    #[test]
+    fn test_timestamp_ntz_legacy_alias() {
+        assert_eq!(
+            TableFeature::from("timestampNtz"),
+            TableFeature::TimestampWithoutTimezone
+        );
+        assert_eq!(
+            TableFeature::from("timestampWithoutTimezone"),
+            TableFeature::TimestampWithoutTimezone
+        );
+
+        assert_eq!(
+            serde_json::from_str::<TableFeature>("\"timestampNtz\"").unwrap(),
+            TableFeature::TimestampWithoutTimezone
+        );
+        assert_eq!(
+            serde_json::from_str::<TableFeature>("\"timestampWithoutTimezone\"").unwrap(),
+            TableFeature::TimestampWithoutTimezone
+        );
+
+        assert_eq!(
+            TableFeature::TimestampWithoutTimezone.to_string(),
+            "timestampNtz"
+        );
+        assert_eq!(
+            TableFeature::TimestampWithoutTimezone.as_ref(),
+            "timestampNtz"
+        );
+        assert_eq!(
+            serde_json::to_string(&TableFeature::TimestampWithoutTimezone).unwrap(),
+            "\"timestampNtz\""
+        );
     }
 
     #[test]
@@ -996,13 +1137,15 @@ mod tests {
                 TableFeature::VariantTypePreview => "variantType-preview",
                 TableFeature::VariantShredding => "variantShredding",
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
+                TableFeature::AdaptiveMetadataPreview => "adaptiveMetadata-preview",
                 TableFeature::AllowColumnDefaults => "allowColumnDefaults",
+                TableFeature::GeospatialType => "geospatial",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };
 
             // strum
             assert_eq!(feature.to_string(), expected);
-            assert_eq!(feature, expected.into_table_feature());
+            assert_eq!(feature, TableFeature::from(expected));
 
             // json
             let serialized = serde_json::to_string(&feature).unwrap();

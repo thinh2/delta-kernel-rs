@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use super::Transaction;
-use crate::actions::{get_log_commit_info_schema, CommitInfo, COMMIT_INFO_NAME};
-use crate::expressions::{MapData, Scalar};
-use crate::schema::{MapType, StructField, StructType, ToSchema};
+use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
+use crate::expressions::{lit, null_lit, MapData, Scalar};
+use crate::schema::{schema_ref, MapType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef, IntoEngineData};
 
@@ -16,44 +16,27 @@ fn commit_info_literal_exprs(
 ) -> Result<Vec<(&'static str, ExpressionRef)>, Error> {
     let op_params_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
     let literal_exprs = vec![
-        (
-            "timestamp",
-            Arc::new(Expression::literal(commit_info.timestamp)),
-        ),
+        ("timestamp", Arc::new(lit(commit_info.timestamp))),
         (
             "inCommitTimestamp",
-            Arc::new(Expression::literal(commit_info.in_commit_timestamp)),
+            Arc::new(lit(commit_info.in_commit_timestamp)),
         ),
-        (
-            "operation",
-            Arc::new(Expression::literal(commit_info.operation)),
-        ),
+        ("operation", Arc::new(lit(commit_info.operation))),
         (
             "operationParameters",
-            Arc::new(Expression::literal(
-                match commit_info.operation_parameters {
-                    Some(map) => Scalar::Map(MapData::try_new(
-                        op_params_map_type,
-                        map.into_iter()
-                            .map(|(k, v)| (Scalar::String(k), Scalar::String(v))),
-                    )?),
-                    None => Scalar::null(op_params_map_type),
-                },
-            )),
+            Arc::new(match commit_info.operation_parameters {
+                Some(map) => lit(MapData::try_new(
+                    op_params_map_type,
+                    map.into_iter()
+                        .map(|(k, v)| (Scalar::String(k), Scalar::String(v))),
+                )?),
+                None => null_lit(op_params_map_type),
+            }),
         ),
-        (
-            "kernelVersion",
-            Arc::new(Expression::literal(commit_info.kernel_version)),
-        ),
-        (
-            "isBlindAppend",
-            Arc::new(Expression::literal(commit_info.is_blind_append)),
-        ),
-        (
-            "engineInfo",
-            Arc::new(Expression::literal(commit_info.engine_info)),
-        ),
-        ("txnId", Arc::new(Expression::literal(commit_info.txn_id))),
+        ("kernelVersion", Arc::new(lit(commit_info.kernel_version))),
+        ("isBlindAppend", Arc::new(lit(commit_info.is_blind_append))),
+        ("engineInfo", Arc::new(lit(commit_info.engine_info))),
+        ("txnId", Arc::new(lit(commit_info.txn_id))),
     ];
     let expected_expr_len = CommitInfo::to_schema().fields().len();
     if literal_exprs.len() != expected_expr_len {
@@ -104,12 +87,9 @@ impl<S> Transaction<S> {
 
                 // Step 3: Wrap the patch in a struct expression so the output matches the
                 // Delta log action format `{ "commitInfo": { merged fields... } }`, consistent
-                // with the None branch which uses `get_log_commit_info_schema()`.
+                // with the None branch which uses `LOG_COMMIT_INFO_SCHEMA`.
                 let wrapped_expr = Expression::struct_from([patch]);
-                let wrapped_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-                    COMMIT_INFO_NAME,
-                    output_schema,
-                )]));
+                let wrapped_schema = schema_ref! { nullable COMMIT_INFO_NAME: (output_schema) };
                 let evaluator = engine.evaluation_handler().new_expression_evaluator(
                     engine_commit_info_schema.clone(),
                     Arc::new(wrapped_expr),
@@ -117,9 +97,7 @@ impl<S> Transaction<S> {
                 )?;
                 evaluator.evaluate(engine_commit_info.as_ref())
             }
-            None => {
-                kernel_commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine)
-            }
+            None => kernel_commit_info.into_engine_data(LOG_COMMIT_INFO_SCHEMA.clone(), engine),
         }
     }
 }
@@ -140,9 +118,10 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::schema::{Schema, SchemaRef, StructField, StructType, ToSchema};
+    use crate::schema::{schema_ref, Schema, SchemaRef, ToSchema};
     use crate::transaction::Transaction;
-    use crate::utils::test_utils::load_test_table;
+    use crate::unit_test_utils::load_test_table;
+    use crate::utils::FoldWithOption as _;
     use crate::{DeltaResult, Engine, EngineData};
 
     // ── build_commit_info tests ────────────────────────────────────────────────
@@ -236,17 +215,17 @@ mod tests {
         engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     ) -> DeltaResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let mut txn = snapshot
+        let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_operation("WRITE".to_string());
-        if let Some((engine_commit_info_data, engine_commit_info_schema)) = engine_commit_info {
-            txn = txn.with_commit_info(engine_commit_info_data, engine_commit_info_schema);
-        }
+            .with_operation("WRITE".to_string())
+            .fold_with(engine_commit_info, |txn, (data, schema)| {
+                txn.with_commit_info(data, schema)
+            });
         Ok((engine, txn))
     }
 
     /// no engine_commit_info -- output is the kernel CommitInfo wrapped in a "commitInfo"
-    /// outer struct, matching the Delta log action format produced by `get_log_commit_info_schema`.
+    /// outer struct, matching the Delta log action format produced by `LOG_COMMIT_INFO_SCHEMA`.
     #[test]
     fn test_build_commit_info_none_branch() -> DeltaResult<()> {
         let (engine, txn) = make_txn(None)?;
@@ -464,7 +443,7 @@ mod tests {
     fn test_build_commit_info_empty_engine_schema() -> DeltaResult<()> {
         // A 0-row, 0-column RecordBatch with an empty kernel schema.
         let empty_batch = RecordBatch::new_empty(Arc::new(ArrowSchema::empty()));
-        let empty_schema = Arc::new(StructType::new_unchecked(Vec::<StructField>::new()));
+        let empty_schema = schema_ref! {};
         let (engine, txn) = make_txn(Some((
             Box::new(ArrowEngineData::new(empty_batch)),
             empty_schema,

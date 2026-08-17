@@ -30,7 +30,7 @@ use tracing::{info, trace, warn};
 use url::Url;
 
 use crate::log_segment::LogSegment;
-use crate::log_segment_files::{list_from_storage, should_process_log_file};
+use crate::log_segment_files::{list_delta_log_from_storage, should_process_log_file};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
@@ -409,21 +409,15 @@ pub(crate) fn timestamp_to_version(
         _ => {}
     }
 
-    // TODO(#2443): Support staged commits (catalog-managed tables). Staged commits have ICT
-    // (required by catalog-managed), so timestamps are available. However, we currently
-    // rebuild the log segment from storage which doesn't include staged commits. To support
-    // this, we'd need to pass the snapshot's log_tail into the log segment construction.
-    let has_staged_commits = snapshot
+    // Catalog-managed tables carry staged commits that exist only in the snapshot's log_tail,
+    // not on the filesystem. These commits carry ICT, so to support timestamp conversion we pass
+    // the log_tail in for catalog-managed tables.
+    let staged_log_tail: Vec<ParsedLogPath> = snapshot
         .log_segment()
         .listed
-        .ascending_commit_files
-        .last() // Use last since a log segment always ends with staged commits from `log_tail`
-        .is_some_and(|c| c.file_type == crate::path::LogPathFileType::StagedCommit);
-    if has_staged_commits {
-        return Err(LogHistoryError::internal_message(
-            "timestamp conversion not yet supported for snapshots with staged commits",
-        ));
-    }
+        .staged_commits()
+        .cloned()
+        .collect();
 
     let listing_limit = match resolved_commit_type {
         HistoryCommitType::Published => None,
@@ -465,6 +459,7 @@ pub(crate) fn timestamp_to_version(
         snapshot.log_segment().log_root.clone(),
         snapshot.version(),
         listing_limit,
+        staged_log_tail,
     )
     .map_err(|e| {
         LogHistoryError::internal("failed to build log segment for timestamp conversion", e)
@@ -723,7 +718,7 @@ fn get_earliest_published_commit_version(
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
-    list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
+    list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
         .filter_ok(|f| f.file_type == LogPathFileType::Commit)
         .next()
         .transpose()?
@@ -773,7 +768,8 @@ fn get_earliest_recreatable_commit(
     let mut multi_part_checkpoint_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
     let mut earliest_commit_version: Option<Version> = None;
 
-    let listing = list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?;
+    let listing =
+        list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?;
     for parsed_result in listing {
         let parsed_log_path = parsed_result?;
         if !should_process_log_file(&parsed_log_path) {
@@ -798,7 +794,7 @@ fn get_earliest_recreatable_commit(
                     }
                 }
             }
-            LogPathFileType::SinglePartCheckpoint | LogPathFileType::UuidCheckpoint => {
+            LogPathFileType::ClassicCheckpoint | LogPathFileType::UuidCheckpoint => {
                 last_complete_checkpoint = Some(parsed_log_path.version);
             }
             LogPathFileType::MultiPartCheckpoint {
@@ -913,17 +909,17 @@ mod tests {
     use crate::actions::{CommitInfo, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{DataType, SchemaRef, StructField, StructType};
-    use crate::snapshot::Snapshot;
+    use crate::schema::{schema_ref, SchemaRef};
+    use crate::snapshot::{Snapshot, SnapshotBuilder};
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::{Action, LocalMockTable};
+    use crate::unit_test_utils::{Action, LocalMockTable};
+    use crate::utils::FoldWithOption as _;
     use crate::Version;
 
     fn get_test_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]))
+        schema_ref! {
+            nullable "value": INTEGER,
+        }
     }
 
     fn set_mod_time(mock_table: &LocalMockTable, version: Version, timestamp: Timestamp) {
@@ -1033,16 +1029,16 @@ mod tests {
         let table = mock_table_with_timestamps(timestamps, ict_enablement).await;
         let engine = SyncEngine::new();
         let path = Url::from_directory_path(table.table_root()).unwrap();
-        let mut builder = Snapshot::builder_for(path);
-        if let Some(v) = at_version {
-            builder = builder.at_version(v);
-        }
-        let snapshot = builder.build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(path)
+            .fold_with(at_version, SnapshotBuilder::at_version)
+            .build(&engine)
+            .unwrap();
         let log_segment = LogSegment::for_timestamp_conversion(
             engine.storage_handler().as_ref(),
             snapshot.log_segment().log_root.clone(),
             snapshot.version(),
             None,
+            vec![],
         )
         .unwrap();
         (table, engine, snapshot, log_segment)
@@ -1157,6 +1153,7 @@ mod tests {
             snapshot.log_segment().log_root.clone(),
             snapshot.version(),
             None,
+            vec![],
         )
         .unwrap();
 

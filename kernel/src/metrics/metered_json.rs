@@ -9,8 +9,8 @@ use crate::metrics::events::emit_json_read_completed;
 use crate::metrics::PrecountedMetricsIterator;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator, FileMeta,
-    FilteredEngineData, JsonHandler, PredicateRef,
+    CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator,
+    FileMeta, FileSize, FilteredEngineData, JsonHandler, PredicateRef,
 };
 
 /// Decorator over an engine-provided `Arc<dyn JsonHandler>` that emits a
@@ -39,6 +39,21 @@ impl std::fmt::Debug for MeteredJsonHandler {
     }
 }
 
+impl MeteredJsonHandler {
+    /// Wraps `inner` so it emits a `JsonReadCompleted` span carrying `num_files` and the summed
+    /// `bytes_read` of `files` when the iterator is exhausted or dropped.
+    fn meter(files: &[FileMeta], inner: FileDataReadResultIterator) -> FileDataReadResultIterator {
+        let num_files = files.len() as u64;
+        let bytes_read = files.iter().map(|f| f.size).sum();
+        Box::new(PrecountedMetricsIterator::new(
+            inner,
+            num_files,
+            bytes_read,
+            emit_json_read_completed,
+        ))
+    }
+}
+
 impl JsonHandler for MeteredJsonHandler {
     fn parse_json(
         &self,
@@ -54,17 +69,26 @@ impl JsonHandler for MeteredJsonHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let num_files = files.len() as u64;
-        let bytes_read = files.iter().map(|f| f.size).sum();
         let inner = self
             .inner
             .read_json_files(files, physical_schema, predicate)?;
-        Ok(Box::new(PrecountedMetricsIterator::new(
-            inner,
-            num_files,
-            bytes_read,
-            emit_json_read_completed,
-        )))
+        Ok(Self::meter(files, inner))
+    }
+
+    fn read_json_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        let inner = self.inner.read_json_files_with_cancellation(
+            files,
+            physical_schema,
+            predicate,
+            cancellation_token,
+        )?;
+        Ok(Self::meter(files, inner))
     }
 
     fn write_json_file(
@@ -72,7 +96,7 @@ impl JsonHandler for MeteredJsonHandler {
         path: &url::Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         self.inner.write_json_file(path, data, overwrite)
     }
 }
@@ -88,11 +112,16 @@ mod tests {
     use crate::arrow::datatypes::Schema;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::metrics::MetricEvent;
-    use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::schema::schema_ref;
+    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
-    #[derive(Debug)]
-    struct StubJsonHandler;
+    #[derive(Debug, Default)]
+    struct StubJsonHandler {
+        /// Set when the cancellation-aware read variant is invoked, so a test can assert the
+        /// metered wrapper forwards to it (rather than the plain read).
+        cancellation_read_called: std::sync::atomic::AtomicBool,
+        write_size: Option<FileSize>,
+    }
 
     fn empty_batch() -> Box<dyn EngineData> {
         Box::new(ArrowEngineData::new(RecordBatch::new_empty(Arc::new(
@@ -118,13 +147,26 @@ mod tests {
             Ok(Box::new(std::iter::empty()))
         }
 
+        fn read_json_files_with_cancellation(
+            &self,
+            _files: &[FileMeta],
+            _physical_schema: SchemaRef,
+            _predicate: Option<PredicateRef>,
+            _cancellation_token: Option<CancellationTokenRef>,
+        ) -> DeltaResult<FileDataReadResultIterator> {
+            self.cancellation_read_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(std::iter::empty()))
+        }
+
         fn write_json_file(
             &self,
             _path: &Url,
             _data: DeltaResultIterator<'_, FilteredEngineData>,
             _overwrite: bool,
-        ) -> DeltaResult<()> {
-            Ok(())
+        ) -> DeltaResult<FileSize> {
+            self.write_size
+                .ok_or_else(|| crate::Error::generic("StubJsonHandler does not support writes"))
         }
     }
 
@@ -143,13 +185,13 @@ mod tests {
     }
 
     fn delta_schema() -> SchemaRef {
-        Arc::new(StructType::try_new([StructField::nullable("x", DataType::INTEGER)]).unwrap())
+        schema_ref! { nullable "x": INTEGER }
     }
 
     #[test]
     fn read_json_files_emits_json_read_completed() {
         let (reporter, _guard) = install_capture();
-        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler);
+        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler::default());
         let handler = MeteredJsonHandler::new(inner);
 
         let files = vec![fake_file("0.json", 100), fake_file("1.json", 50)];
@@ -173,7 +215,7 @@ mod tests {
     #[test]
     fn read_json_files_emits_on_drop_without_consumption() {
         let (reporter, _guard) = install_capture();
-        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler);
+        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler::default());
         let handler = MeteredJsonHandler::new(inner);
 
         let files = vec![fake_file("0.json", 100), fake_file("1.json", 50)];
@@ -195,10 +237,38 @@ mod tests {
         assert_eq!(e.bytes_read, 150);
     }
 
+    // The metered wrapper's cancellation-aware read must forward to the inner handler's
+    // cancellation-aware read (not the plain one) AND still emit the metrics span.
+    #[test]
+    fn metered_wrapper_forwards_cancellation_read_and_emits_metrics() {
+        let (reporter, _guard) = install_capture();
+        let stub = Arc::new(StubJsonHandler::default());
+        let handler = MeteredJsonHandler::new(stub.clone() as Arc<dyn JsonHandler>);
+
+        let files = vec![fake_file("0.json", 100), fake_file("1.json", 50)];
+        let iter = handler
+            .read_json_files_with_cancellation(&files, delta_schema(), None, None)
+            .unwrap();
+        let _: Vec<_> = iter.collect();
+
+        assert!(
+            stub.cancellation_read_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "metered wrapper must forward to the inner cancellation-aware read"
+        );
+        let events = reporter.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::JsonReadCompleted(_))),
+            "cancellation-aware read must still emit JsonReadCompleted"
+        );
+    }
+
     #[test]
     fn read_json_files_emits_zero_event_for_empty_input() {
         let (reporter, _guard) = install_capture();
-        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler);
+        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler::default());
         let handler = MeteredJsonHandler::new(inner);
 
         let iter = handler.read_json_files(&[], delta_schema(), None).unwrap();
@@ -217,9 +287,40 @@ mod tests {
     }
 
     #[test]
+    fn write_json_file_forwards_size_without_emitting_metrics() {
+        let (reporter, _guard) = install_capture();
+        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler {
+            write_size: Some(42),
+            ..Default::default()
+        });
+        let handler = MeteredJsonHandler::new(inner);
+        let path = Url::parse("memory:///_delta_log/0.json").unwrap();
+
+        let written_size = handler
+            .write_json_file(&path, Box::new(std::iter::empty()), false)
+            .unwrap();
+
+        assert_eq!(written_size, 42);
+        assert!(reporter.events().is_empty());
+    }
+
+    #[test]
+    fn write_json_file_forwards_errors() {
+        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler::default());
+        let handler = MeteredJsonHandler::new(inner);
+        let path = Url::parse("memory:///_delta_log/0.json").unwrap();
+
+        let error = handler
+            .write_json_file(&path, Box::new(std::iter::empty()), false)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("does not support writes"));
+    }
+
+    #[test]
     #[should_panic(expected = "wraps another MeteredJsonHandler")]
     fn new_panics_on_double_wrap() {
-        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler);
+        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler::default());
         let once: Arc<dyn JsonHandler> = Arc::new(MeteredJsonHandler::new(inner));
         let _twice = MeteredJsonHandler::new(once);
     }

@@ -2,25 +2,36 @@
 
 use std::sync::Arc;
 
+use tracing::debug;
 use url::Url;
 
 use crate::engine::arrow_utils;
-use crate::plans::{Operation, PlanExecutor, QueryPlanBuilder};
+use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
-    FilteredEngineData, JsonHandler, PredicateRef,
+    FileSize, FilteredEngineData, JsonHandler, PredicateRef,
 };
 
 /// A [`JsonHandler`] that delegates to a [`PlanExecutor`].
+///
+/// Operations not yet implemented on the plan-execution path delegate to `fallback` when one is
+/// configured, and otherwise return an unsupported error.
 pub struct PlanBasedJsonHandler {
     executor: Arc<dyn PlanExecutor>,
+    fallback: Option<Arc<dyn JsonHandler>>,
 }
 
 impl PlanBasedJsonHandler {
-    pub fn new(plan_executor: Arc<dyn PlanExecutor>) -> Self {
+    /// Construct a handler that delegates not-yet-implemented operations to `fallback`, or returns
+    /// an unsupported error for them when `fallback` is `None`.
+    pub fn new(
+        plan_executor: Arc<dyn PlanExecutor>,
+        fallback: Option<Arc<dyn JsonHandler>>,
+    ) -> Self {
         Self {
             executor: plan_executor,
+            fallback,
         }
     }
 }
@@ -42,7 +53,7 @@ impl JsonHandler for PlanBasedJsonHandler {
     ) -> DeltaResult<FileDataReadResultIterator> {
         // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
         // single-node executor can then match the filter -> scan shape.
-        let query = QueryPlanBuilder::scan_json(files.to_vec(), physical_schema).build()?;
+        let query = PlanBuilder::scan_json(files.to_vec(), &[], physical_schema)?.build()?;
         self.executor
             .execute_op(Operation::QueryPlan(query))?
             .into_data()
@@ -50,13 +61,18 @@ impl JsonHandler for PlanBasedJsonHandler {
 
     fn write_json_file(
         &self,
-        _path: &Url,
-        _data: DeltaResultIterator<'_, FilteredEngineData>,
-        _overwrite: bool,
-    ) -> DeltaResult<()> {
-        Err(Error::unsupported(
-            "PlanBasedJsonHandler does not support write_json_file yet",
-        ))
+        path: &Url,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
+        overwrite: bool,
+    ) -> DeltaResult<FileSize> {
+        let Some(fallback) = &self.fallback else {
+            return Err(Error::unsupported(
+                "PlanBasedJsonHandler does not support write_json_file yet, and no fallback \
+                 handler is configured",
+            ));
+        };
+        debug!(%path, "PlanBasedJsonHandler delegating write_json_file to fallback handler");
+        fallback.write_json_file(path, data, overwrite)
     }
 }
 
@@ -67,18 +83,60 @@ mod tests {
     use std::io::Write as _;
     use std::sync::Arc;
 
-    use tempfile::NamedTempFile;
+    use rstest::rstest;
+    use tempfile::{tempdir, NamedTempFile};
     use url::Url;
 
     use super::PlanBasedJsonHandler;
-    use crate::arrow::array::{Int32Array, RecordBatch, StringArray};
+    use crate::arrow::array::{Array, Int32Array, RecordBatch, StringArray};
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::plans::parquet::PlanBasedParquetHandler;
     use crate::engine::sync::plan::SyncPlanExecutor;
-    use crate::schema::{DataType, StructField, StructType};
-    use crate::{EngineData, FileMeta, JsonHandler as _};
+    use crate::engine::sync::SyncEngine;
+    use crate::engine_data::FilteredEngineData;
+    use crate::schema::{schema_ref, SchemaRef};
+    use crate::{
+        DeltaResult, Engine as _, EngineData, FileDataReadResultIterator, FileMeta,
+        JsonHandler as _, ParquetHandler as _,
+    };
 
     fn make_handler() -> PlanBasedJsonHandler {
-        PlanBasedJsonHandler::new(Arc::new(SyncPlanExecutor::new()))
+        PlanBasedJsonHandler::new(
+            Arc::new(SyncPlanExecutor::default()),
+            Some(SyncEngine::new().json_handler()),
+        )
+    }
+
+    fn single_column_data(values: Vec<&str>) -> Box<dyn EngineData> {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "x",
+            Arc::new(StringArray::from(values)) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        Box::new(ArrowEngineData::new(batch))
+    }
+
+    #[test]
+    fn test_write_json_file_delegates_to_fallback() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("out.json");
+        let url = Url::from_file_path(&path).unwrap();
+        let filtered = Ok(FilteredEngineData::with_all_rows_selected(
+            single_column_data(vec!["a", "b"]),
+        ));
+        let written_size = make_handler()
+            .write_json_file(&url, Box::new(std::iter::once(filtered)), false)
+            .unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written_size, contents.len() as u64);
+        assert_eq!(contents, "{\"x\":\"a\"}\n{\"x\":\"b\"}\n");
+    }
+
+    fn make_parquet_handler() -> PlanBasedParquetHandler {
+        PlanBasedParquetHandler::new(
+            Arc::new(SyncPlanExecutor::default()),
+            Some(SyncEngine::new().parquet_handler()),
+        )
     }
 
     fn temp_json_file(lines: &[&str]) -> (NamedTempFile, FileMeta) {
@@ -100,8 +158,7 @@ mod tests {
     #[test]
     fn test_read_json_files() {
         let (_temp, file_meta) = temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#, r#"{"x": 3}"#]);
-        let schema =
-            Arc::new(StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap());
+        let schema = schema_ref! { not_null "x": INTEGER };
 
         let mut iter = make_handler()
             .read_json_files(&[file_meta], schema, None)
@@ -124,6 +181,19 @@ mod tests {
         assert!(iter.next().is_none(), "expected exactly one batch");
     }
 
+    fn test_schema() -> SchemaRef {
+        schema_ref! { not_null "x": INTEGER }
+    }
+
+    /// No files -> an absent plan -> a zero-row result (no rows, no error), for either handler.
+    #[rstest]
+    #[case(make_handler().read_json_files(&[], test_schema(), None))]
+    #[case(make_parquet_handler().read_parquet_files(&[], test_schema(), None))]
+    fn empty_input_yields_no_rows(#[case] res: DeltaResult<FileDataReadResultIterator>) {
+        let rows: usize = res.unwrap().map(|batch| batch.unwrap().len()).sum();
+        assert_eq!(rows, 0);
+    }
+
     #[test]
     fn test_parse_json() {
         let json_strings = StringArray::from(vec![r#"{"x": 1}"#, r#"{"x": 2}"#, r#"{"x": 3}"#]);
@@ -134,8 +204,7 @@ mod tests {
         .unwrap();
         let input: Box<dyn EngineData> = Box::new(ArrowEngineData::new(input_batch));
 
-        let output_schema =
-            Arc::new(StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap());
+        let output_schema = schema_ref! { not_null "x": INTEGER };
 
         let parsed = make_handler().parse_json(input, output_schema).unwrap();
         let record_batch: RecordBatch = ArrowEngineData::try_from_engine_data(parsed)

@@ -130,7 +130,6 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::actions::get_log_add_schema;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::log_replay::FileActionKey;
@@ -143,14 +142,17 @@ mod tests {
         AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState,
     };
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
-    use crate::scan::log_replay::{ScanLogReplayProcessor, ScanStatsOptions};
+    use crate::scan::log_replay::{
+        ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
+    };
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
-    use crate::scan::StatsOptions;
-    use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::{
+    use crate::scan::{ScanBuilder, StatsOptions};
+    use crate::schema::{schema_ref, DataType, StructField, StructType};
+    use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
     };
+    use crate::utils::FoldWithOption as _;
     use crate::{PredicateRef, SnapshotRef};
 
     // ============================================================
@@ -184,10 +186,9 @@ mod tests {
 
     /// Creates a simple table schema for tests
     fn test_schema() -> Arc<StructType> {
-        Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]))
+        schema_ref! {
+            nullable "value": INTEGER,
+        }
     }
 
     /// Creates a ScanLogReplayProcessor with a pre-populated HashMap.
@@ -210,6 +211,7 @@ mod tests {
             checkpoint_info,
             seen_file_keys,
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
     }
 
@@ -383,11 +385,11 @@ mod tests {
         snapshot: &SnapshotRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<Vec<String>> {
-        let mut builder = snapshot.clone().scan_builder();
-        if let Some(pred) = predicate {
-            builder = builder.with_predicate(pred);
-        }
-        let scan = builder.build()?;
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .fold_with(predicate, ScanBuilder::with_predicate)
+            .build()?;
         let mut scan_metadata_iter = scan.scan_metadata(engine)?;
 
         let mut paths = scan_metadata_iter.try_fold(Vec::new(), |acc, metadata_res| {
@@ -410,11 +412,11 @@ mod tests {
 
         let expected_paths = get_expected_paths(engine.as_ref(), &snapshot, predicate.clone())?;
 
-        let mut builder = snapshot.scan_builder();
-        if let Some(pred) = predicate {
-            builder = builder.with_predicate(pred);
-        }
-        let scan = builder.build()?;
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .fold_with(predicate, ScanBuilder::with_predicate)
+            .build()?;
         let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
 
         let mut all_paths = sequential.try_fold(Vec::new(), |acc, metadata_res| {
@@ -641,8 +643,8 @@ mod tests {
         );
 
         // Verify timing metrics are present and parseable (values may be 0 for fast operations)
-        let _dedup_time = extract_metric(sequential_logs, "dedup_visitor_time_ms");
-        let _predicate_eval_time = extract_metric(sequential_logs, "predicate_eval_time_ms");
+        let _dedup_time = extract_metric(sequential_logs, "dedup_visitor_time_ns");
+        let _predicate_eval_time = extract_metric(sequential_logs, "predicate_eval_time_ns");
 
         // Verify Parallel metrics if expected
         if let Some(expected) = parallel_expected {
@@ -666,8 +668,8 @@ mod tests {
                 total_predicate_filtered += extract_metric(remaining, "predicate_filtered");
 
                 // Verify timing metrics are present and parseable in parallel phase
-                let _dedup_time = extract_metric(remaining, "dedup_visitor_time_ms");
-                let _predicate_eval_time = extract_metric(remaining, "predicate_eval_time_ms");
+                let _dedup_time = extract_metric(remaining, "dedup_visitor_time_ns");
+                let _predicate_eval_time = extract_metric(remaining, "predicate_eval_time_ns");
 
                 search_start = absolute_pos + 1;
             }
@@ -744,8 +746,8 @@ mod tests {
         // Tests data skipping filtering based on column stats (min/max values)
         path: "v2-checkpoints-json-with-sidecars",
         predicate: Some({
-            use crate::expressions::{column_expr, Expression as Expr};
-            Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)))
+            use crate::expressions::{col, lit, Expression as Expr};
+            Arc::new(Expr::gt(col!("id"), lit(20i64)))
         }),
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
@@ -773,8 +775,8 @@ mod tests {
         // partition values -- those are correctly filtered since is_add=true for them.
         path: "basic_partitioned",
         predicate: Some({
-            use crate::expressions::{column_expr, Expression as Expr};
-            Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))
+            use crate::expressions::{col, lit, Expression as Expr};
+            Arc::new(Expr::eq(col!("letter"), lit("a")))
         }),
         expected_sequential_metrics: ExpectedMetrics {
             // Columnar filter prunes all 4 non-matching files (b, c, e, null) before the

@@ -2,13 +2,15 @@
 //! execution to happen outside of Rust).
 use std::sync::Arc;
 
+use delta_kernel::plans::proto::schema as proto_schema;
+use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error, Operation, ParquetFooter, PlanExecutor, PlanResult};
 use delta_kernel_ffi_macros::handle_descriptor;
+use prost::Message as _;
 
 use crate::error::EngineExecResult;
 use crate::plans::iter::{FfiBytesIter, FfiEngineDataIter, FfiFileMetaIter};
 use crate::plans::result::{CParquetFooter, CPlanResult};
-use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{kernel_bytes_slice, KernelBytesSlice, NullableCvoid};
 
 /// A shared (`Arc`-like) handle to an [`PlanExecutor`].
@@ -55,9 +57,8 @@ unsafe impl Send for FfiPlanExecutor {}
 unsafe impl Sync for FfiPlanExecutor {}
 
 impl PlanExecutor for FfiPlanExecutor {
-    fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
-        // TODO: serialize `_op` to bytes once proto schema is checked in.
-        let plan_proto_bytes: &[u8] = &[];
+    fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
+        let plan_proto_bytes = op.to_proto_bytes();
         let plan_proto_slice = kernel_bytes_slice!(plan_proto_bytes);
 
         let mut out = EngineExecResult::Uninit;
@@ -84,44 +85,43 @@ impl PlanExecutor for FfiPlanExecutor {
     }
 }
 
-/// Convert a [`CParquetFooter`] into a kernel [`ParquetFooter`]
+/// Convert a [`CParquetFooter`] into a kernel [`ParquetFooter`].
 ///
-/// Returns an error if schema visiting produces an invalid schema.
+/// Consumes the embedded [`ExclusiveRustBytes`](crate::ExclusiveRustBytes) handle carrying
+/// the proto-serialized schema, returning an error if the bytes are not a valid schema proto
+/// message.
 fn decode_parquet_footer(footer: CParquetFooter) -> DeltaResult<ParquetFooter> {
-    let CParquetFooter { schema } = footer;
-    let mut visitor_state = KernelSchemaVisitorState::default();
-    let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
-
-    // TODO: we currently use the existing visitor pattern for sending schema, but
-    // to be consistent with how we send the input plan (which includes schema), we could just use
-    // proto to serialize the schema here too.
-    let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
-    Ok(ParquetFooter {
-        schema: Arc::new(schema),
-    })
+    let CParquetFooter { schema_proto } = footer;
+    // SAFETY: ExclusiveRustBytes should only have a single owner, so consuming here is safe.
+    let bytes = *unsafe { schema_proto.into_inner() };
+    let proto = proto_schema::StructType::decode(bytes.as_slice()).map_err(Error::generic_err)?;
+    let schema = Arc::new(StructType::try_from(proto)?);
+    Ok(ParquetFooter { schema })
 }
 
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
     use std::ptr::NonNull;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use delta_kernel::arrow::array::ffi::FFI_ArrowArray;
-    use delta_kernel::schema::DataType as KernelDataType;
+    use delta_kernel::plans::proto::{operation as proto, schema as proto_schema};
+    use delta_kernel::schema::{schema, DataType as KernelDataType};
     use delta_kernel::Error;
+    use prost::Message;
     use url::Url;
 
     use super::*;
     use crate::error::{EngineExecError, KernelError};
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
     use crate::handle::Handle;
     use crate::plans::get_plan_executor;
     use crate::plans::iter::{CBytesIterator, CEngineDataIterator, CFileMetaIterator};
     use crate::plans::result::CParquetFooter;
-    use crate::scan::EngineSchema;
-    use crate::schema_visitor::{visit_field_integer, visit_field_struct};
-    use crate::{kernel_string_slice, ExclusiveEngineData, ExclusiveRustString, OptionalValue};
+    use crate::{
+        allocate_kernel_bytes, kernel_bytes_slice, ExclusiveEngineData, ExclusiveRustString,
+        OptionalValue,
+    };
 
     extern "C" fn noop_free(_state: NullableCvoid) {}
 
@@ -142,8 +142,8 @@ mod tests {
     }
 
     /// Executes a dummy plan operation against a `PlanExecutor` whose callback returns the given
-    /// `expected_plan_result`. Returns the resulting `PlanResult` for furhter validation.
-    fn execute_dummy_op(expected_plan_result: CPlanResult) -> PlanResult {
+    /// `expected_plan_result`, returning the raw result of `execute_op`.
+    fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> DeltaResult<PlanResult> {
         let cell: Mutex<Option<CPlanResult>> = Mutex::new(Some(expected_plan_result));
         let context = NonNull::new(&cell as *const Mutex<Option<CPlanResult>> as *mut c_void);
         let executor = unsafe { get_plan_executor(context, mock_execute_op) };
@@ -153,7 +153,13 @@ mod tests {
         let url = Url::parse("memory:///table/").unwrap();
         let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url));
 
-        plan_executor.execute_op(op).expect("execute_op succeeds")
+        plan_executor.execute_op(op)
+    }
+
+    /// Like [`try_execute_dummy_op`], but asserts the operation succeeds and returns the
+    /// resulting `PlanResult` for further validation.
+    fn execute_dummy_op(expected_plan_result: CPlanResult) -> PlanResult {
+        try_execute_dummy_op(expected_plan_result).expect("execute_op succeeds")
     }
 
     #[test]
@@ -283,42 +289,12 @@ mod tests {
         assert!(bytes_iter.next().is_none(), "empty bytes iterator");
     }
 
-    /// Schema visitor that produces `{id: integer (nullable)}`.
-    extern "C" fn visit_id_only_schema(
-        _schema_ptr: *mut c_void,
-        state: &mut KernelSchemaVisitorState,
-    ) -> usize {
-        let id = "id";
-        let id_field_id = unsafe {
-            ok_or_panic(visit_field_integer(
-                state,
-                kernel_string_slice!(id),
-                true,
-                allocate_err,
-            ))
-        };
-        let field_ids = [id_field_id];
-        let schema = "schema";
-        unsafe {
-            ok_or_panic(visit_field_struct(
-                state,
-                kernel_string_slice!(schema),
-                field_ids.as_ptr(),
-                1,
-                false,
-                allocate_err,
-            ))
-        }
-    }
-
     #[test]
     fn execute_op_parquet_footer_variant() {
-        let footer = CParquetFooter {
-            schema: EngineSchema {
-                schema: std::ptr::null_mut(),
-                visitor: visit_id_only_schema,
-            },
-        };
+        let schema = schema! { nullable "id": INTEGER };
+        let bytes = proto_schema::StructType::from(&schema).encode_to_vec();
+        let schema_proto = unsafe { allocate_kernel_bytes(kernel_bytes_slice!(bytes)) };
+        let footer = CParquetFooter { schema_proto };
         let footer = execute_dummy_op(CPlanResult::ParquetFooter(footer))
             .into_parquet_footer()
             .expect("ParquetFooter variant");
@@ -326,5 +302,53 @@ mod tests {
         let id_field = footer.schema.field("id").expect("id field");
         assert_eq!(id_field.data_type(), &KernelDataType::INTEGER);
         assert!(id_field.is_nullable());
+    }
+
+    #[test]
+    fn execute_op_parquet_footer_rejects_invalid_schema_bytes() {
+        // Bytes that are not a valid proto-encoded `StructType` message.
+        let bytes = vec![0xffu8; 8];
+        let schema_proto = unsafe { allocate_kernel_bytes(kernel_bytes_slice!(bytes)) };
+        let footer = CParquetFooter { schema_proto };
+
+        let Err(err) = try_execute_dummy_op(CPlanResult::ParquetFooter(footer)) else {
+            panic!("invalid schema proto bytes should fail to decode");
+        };
+        assert!(
+            matches!(err, Error::GenericError { .. }),
+            "expected a proto decode error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn execute_op_passes_serialized_operation_bytes() {
+        extern "C" fn validate_op(
+            _context: NullableCvoid,
+            plan_proto: KernelBytesSlice,
+            out: *mut EngineExecResult<CPlanResult>,
+        ) {
+            let bytes = unsafe { std::slice::from_raw_parts(plan_proto.ptr, plan_proto.len) };
+            let op = proto::Operation::decode(bytes).expect("decode Operation proto");
+            let Some(proto::operation::Op::Io(io)) = op.op else {
+                panic!("expected an IoOperation");
+            };
+            let Some(proto::io_operation::Op::FileListing(file_listing)) = io.op else {
+                panic!("expected a FileListing");
+            };
+            assert_eq!(file_listing.url, "memory:///table/");
+            unsafe { out.write(EngineExecResult::Success(CPlanResult::Unit)) };
+        }
+
+        let executor = unsafe { get_plan_executor(None, validate_op) };
+        let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
+
+        let url = Url::parse("memory:///table/").unwrap();
+        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url));
+
+        plan_executor
+            .execute_op(op)
+            .expect("execute_op succeeds")
+            .into_unit()
+            .expect("Unit variant");
     }
 }

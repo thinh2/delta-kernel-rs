@@ -1,6 +1,7 @@
 //! Default Json handler implementation
 
 use std::io::BufReader;
+use std::num::NonZero;
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -19,8 +20,8 @@ use delta_kernel::object_store::{
 };
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
-    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
-    JsonHandler, PredicateRef,
+    CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, Error,
+    FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
@@ -37,10 +38,10 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// The maximum number of read requests to buffer in memory at once. Note that this actually
     /// controls two things: the number of concurrent requests (done by `buffered`) and the size of
     /// the buffer (via our `sync_channel`).
-    buffer_size: usize,
+    buffer_size: NonZero<usize>,
     /// Limit the number of rows per batch. That is, for batch_size = N, then each RecordBatch
     /// yielded by the stream will have at most N rows.
-    batch_size: usize,
+    batch_size: NonZero<usize>,
 }
 
 impl<E: TaskExecutor> DefaultJsonHandler<E> {
@@ -48,21 +49,21 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         Self {
             store,
             task_executor,
-            buffer_size: super::DEFAULT_BUFFER_SIZE,
-            batch_size: super::DEFAULT_BATCH_SIZE,
+            buffer_size: super::DEFAULT_READ_BUFFER_SIZE,
+            batch_size: super::DEFAULT_READ_BATCH_SIZE,
         }
     }
 
     /// Set the maximum number read requests to buffer in memory at once in
     /// [Self::read_json_files()].
     ///
-    /// Defaults to 1000.
+    /// Defaults to `super::DEFAULT_READ_BUFFER_SIZE`.
     ///
     /// Memory constraints can be imposed by constraining the buffer size and batch size. Note that
     /// overall memory usage is proportional to the product of these two values.
     /// 1. Batch size governs the size of RecordBatches yielded in each iteration of the stream
     /// 2. Buffer size governs the number of concurrent tasks (which equals the size of the buffer
-    pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
+    pub fn with_buffer_size(mut self, buffer_size: NonZero<usize>) -> Self {
         self.buffer_size = buffer_size;
         self
     }
@@ -70,13 +71,13 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     /// Limit the number of rows per batch. That is, for batch_size = N, then each RecordBatch
     /// yielded by the stream will have at most N rows.
     ///
-    /// Defaults to 1000 rows (json objects).
+    /// Defaults to `super::DEFAULT_READ_BATCH_SIZE` rows (json objects).
     ///
     /// See [Decoder::with_buffer_size] for details on constraining memory usage with buffer size
     /// and batch size.
     ///
     /// [Decoder::with_buffer_size]: delta_kernel::arrow::json::reader::Decoder
-    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+    pub fn with_batch_size(mut self, batch_size: NonZero<usize>) -> Self {
         self.batch_size = batch_size;
         self
     }
@@ -133,7 +134,8 @@ async fn write_json_file_impl(
     path: Url,
     buffer: Vec<u8>,
     overwrite: bool,
-) -> DeltaResult<()> {
+) -> DeltaResult<FileSize> {
+    let size = buffer.len() as FileSize;
     let put_mode = if overwrite {
         PutMode::Overwrite
     } else {
@@ -146,7 +148,7 @@ async fn write_json_file_impl(
         object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path.to_string()),
         e => e.into(),
     })?;
-    Ok(())
+    Ok(size)
 }
 
 impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
@@ -164,15 +166,29 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        self.read_json_files_with_cancellation(files, physical_schema, predicate, None)
+    }
+
+    fn read_json_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
         let future = read_json_files_impl(
             self.store.clone(),
             files.to_vec(),
             physical_schema,
             predicate,
-            self.batch_size,
-            self.buffer_size,
+            self.batch_size.get(),
+            self.buffer_size.get(),
         );
-        super::stream_future_to_iter(self.task_executor.clone(), future)
+        super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            future,
+            cancellation_token,
+        )
     }
 
     // note: for now we just buffer all the data and write it out all at once
@@ -181,7 +197,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         self.task_executor.block_on(write_json_file_impl(
             self.store.clone(),
             path.clone(),
@@ -274,13 +290,11 @@ mod tests {
     use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
-    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
-    use delta_kernel::object_store::{CopyOptions, ObjectStore};
     use delta_kernel::object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
-        PutOptions, PutPayload, PutResult, Result,
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
     };
-    use delta_kernel::schema::{DataType as DeltaDataType, Schema, StructField};
+    use delta_kernel::schema::schema_ref;
     use delta_kernel_default_engine_test_utils::{into_record_batch, string_array_to_engine_data};
     use futures::future;
     use itertools::Itertools;
@@ -290,14 +304,6 @@ mod tests {
 
     use super::*;
     use crate::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
-
-    // A wrapper trait that allows us to work with the ObjectStore trait, without directly importing
-    // it and the ambiguous method errors it would bring.
-    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-    trait ObjectStore: delta_kernel::object_store::ObjectStore {}
-
-    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-    impl<T: delta_kernel::object_store::ObjectStore + ?Sized> ObjectStore for T {}
 
     /// Store wrapper that wraps an inner store to guarantee the ordering of GET requests. Note
     /// that since the keys are resolved in order, requests to subsequent keys in the order will
@@ -445,12 +451,6 @@ mod tests {
             self.inner.get_ranges(location, ranges).await
         }
 
-        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-        async fn delete(&self, location: &Path) -> Result<()> {
-            self.inner.delete(location).await
-        }
-
-        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
         fn delete_stream(
             &self,
             locations: BoxStream<'static, Result<Path>>,
@@ -474,19 +474,8 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-        async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
         async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
             self.inner.copy_opts(from, to, options).await
-        }
-
-        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
         }
     }
 
@@ -613,7 +602,7 @@ mod tests {
         assert_eq!(data[0].num_rows(), 4);
 
         // limit batch size
-        let handler = handler.with_batch_size(2);
+        let handler = handler.with_batch_size(NonZero::new(2).unwrap());
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, get_commit_schema().clone(), None)
             .unwrap()
@@ -686,7 +675,6 @@ mod tests {
 
     use std::io::Write;
 
-    use delta_kernel::schema::StructType;
     use delta_kernel::Engine;
     use tempfile::NamedTempFile;
 
@@ -707,8 +695,7 @@ mod tests {
         let _ = tracing_subscriber::fmt().try_init();
         let (_temp_file1, file_url1) = make_invalid_named_temp();
         let (_temp_file2, file_url2) = make_invalid_named_temp();
-        let field = StructField::nullable("name", delta_kernel::schema::DataType::BOOLEAN);
-        let schema = Arc::new(StructType::try_new(vec![field]).unwrap());
+        let schema = schema_ref! { nullable "name": BOOLEAN };
         let default_engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build();
 
         // Helper to check that we get expected number of errors then stream ends
@@ -825,11 +812,9 @@ mod tests {
                     tokio::runtime::Handle::current(),
                 )),
             );
-            let handler = handler.with_buffer_size(*buffer_size);
-            let physical_schema = Arc::new(Schema::new_unchecked(vec![StructField::nullable(
-                "val",
-                DeltaDataType::INTEGER,
-            )]));
+            let handler = handler
+                .with_buffer_size(NonZero::new(*buffer_size).expect("buffer_size is non-zero"));
+            let physical_schema = schema_ref! { nullable "val": INTEGER };
             let data: Vec<RecordBatch> = handler
                 .read_json_files(&files, physical_schema, None)
                 .unwrap()
@@ -903,8 +888,9 @@ mod tests {
         let result =
             handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
 
-        // Verify the first write is successful
-        assert!(result.is_ok());
+        let written_size = result.unwrap();
+        assert_eq!(written_size, 32);
+        assert_eq!(written_size, store.head(&object_path).await.unwrap().size);
         let json = read_json_file(&store, &object_path).await?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
@@ -915,8 +901,9 @@ mod tests {
             handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
 
         if overwrite {
-            // Verify the second write is successful
-            assert!(result.is_ok());
+            let written_size = result.unwrap();
+            assert_eq!(written_size, 28);
+            assert_eq!(written_size, store.head(&object_path).await.unwrap().size);
             let json = read_json_file(&store, &object_path).await?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
@@ -929,6 +916,32 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_empty_json_file_reports_zero_size() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let handler =
+            DefaultJsonHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let path = Url::parse("memory:///test/data/empty.json").unwrap();
+        let object_path = Path::from("/test/data/empty.json");
+
+        let written_size = handler
+            .write_json_file(&path, Box::new(std::iter::empty()), false)
+            .unwrap();
+        let stored_meta = store.head(&object_path).await.unwrap();
+        let stored_bytes = store
+            .get(&object_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        assert_eq!(written_size, 0);
+        assert_eq!(stored_meta.size, 0);
+        assert!(stored_bytes.is_empty());
         Ok(())
     }
 

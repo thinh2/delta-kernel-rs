@@ -9,6 +9,9 @@ syntax = "proto3";
 
 package delta.kernel.expressions;
 
+// Java package for generated bindings. Ignored by prost (Rust codegen).
+option java_package = "io.delta.kernel.proto.expressions";
+
 import "schema.proto";
 
 // ============================================================================
@@ -107,6 +110,8 @@ message Scalar {
     StructData struct = 15;
     ArrayData array = 16;
     MapData map = 17;
+    int32 interval_year_month = 18; // year-month interval: signed month count
+    int64 interval_day_time = 19;   // day-time interval: signed microsecond count
   }
 }
 
@@ -167,6 +172,7 @@ message Transform {
   ColumnName input_path = 1;
   map<string, FieldTransform> field_transforms = 2;
   repeated Expression prepended_fields = 3;
+  repeated Expression appended_fields = 4;
 }
 
 // The opaque op carries only its `name()` because the Rust trait object can't be serialised;
@@ -227,6 +233,7 @@ message Expression {
     UnaryExpression unary = 6;
     BinaryExpression binary = 7;
     VariadicExpression variadic = 8;
+    // TODO: IfExpression is not yet available in Kernel but will be needed in the future.
     IfExpression if_expr = 9;
     OpaqueExpression opaque = 10;
     ParseJsonExpression parse_json = 11;

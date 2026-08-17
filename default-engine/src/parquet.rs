@@ -1,6 +1,7 @@
 //! Default Parquet handler implementation
 
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -10,8 +11,7 @@ use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
 use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_utils::{
-    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
-    RowIndexBuilder,
+    fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, RowIndexBuilder,
 };
 use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use delta_kernel::engine::{reader_options, writer_options};
@@ -29,8 +29,9 @@ use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObject
 use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::WriteContext;
 use delta_kernel::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
-    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
+    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData, Error,
+    FileDataReadResultIterator, FileMeta, FoldWithOption as _, ParquetFooter, ParquetHandler,
+    PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -45,7 +46,11 @@ use crate::UrlExt;
 pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
-    readahead: usize,
+    /// The maximum number of files to read concurrently in [`Self::read_parquet_files()`]. This is
+    /// the number of futures buffered by `buffered`, i.e. the file-level I/O readahead depth.
+    buffer_size: NonZero<usize>,
+    /// The maximum number of rows per RecordBatch yielded by the read stream.
+    batch_size: NonZero<usize>,
 }
 
 /// Metadata of a data file (typically a parquet file).
@@ -149,15 +154,34 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         Self {
             store,
             task_executor,
-            readahead: 10,
+            buffer_size: super::DEFAULT_READ_BUFFER_SIZE,
+            batch_size: super::DEFAULT_READ_BATCH_SIZE,
         }
     }
 
-    /// Max number of batches to read ahead while executing [Self::read_parquet_files()].
+    /// Set the maximum number of files to read concurrently in [Self::read_parquet_files()].
     ///
-    /// Defaults to 10.
-    pub fn with_readahead(mut self, readahead: usize) -> Self {
-        self.readahead = readahead;
+    /// Defaults to `super::DEFAULT_READ_BUFFER_SIZE`.
+    ///
+    /// This setting applies only to object-store reads. When every file in the batch uses a
+    /// presigned URL (`https://...`), reads bypass the object store and this value has no effect;
+    /// use [`Self::with_batch_size`] to tune RecordBatch chunking in that path.
+    ///
+    /// Memory constraints can be imposed by constraining the buffer size and batch size. Note that
+    /// overall memory usage is proportional to the product of these two values.
+    /// 1. Batch size governs the size of RecordBatches yielded in each iteration of the stream.
+    /// 2. Buffer size governs the number of concurrent file reads (which equals the size of the
+    ///    readahead buffer).
+    pub fn with_buffer_size(mut self, buffer_size: NonZero<usize>) -> Self {
+        self.buffer_size = buffer_size;
+        self
+    }
+
+    /// Set the maximum number of rows per RecordBatch yielded by [Self::read_parquet_files()].
+    ///
+    /// Defaults to `super::DEFAULT_READ_BATCH_SIZE` rows.
+    pub fn with_batch_size(mut self, batch_size: NonZero<usize>) -> Self {
+        self.batch_size = batch_size;
         self
     }
 
@@ -171,12 +195,13 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         path: &url::Url,
         data: Box<dyn EngineData>,
         stats_columns: &[ColumnName],
+        physical_schema: &StructType,
     ) -> DeltaResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
 
         // Collect statistics before writing (includes numRecords)
-        let stats = collect_stats(record_batch, stats_columns)?;
+        let stats = collect_stats(record_batch, stats_columns, physical_schema)?;
 
         let mut buffer = vec![];
         let mut writer = ArrowWriter::try_new_with_options(
@@ -235,6 +260,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
                 &write_context.write_dir(),
                 data,
                 write_context.stats_columns(),
+                write_context.physical_schema().as_ref(),
             )
             .await?;
         super::build_add_file_metadata(file_metadata, write_context)
@@ -247,6 +273,8 @@ async fn read_parquet_files_impl(
     files: Vec<FileMeta>,
     physical_schema: SchemaRef,
     predicate: Option<PredicateRef>,
+    buffer_size: usize,
+    batch_size: usize,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
@@ -264,7 +292,7 @@ async fn read_parquet_files_impl(
     // SAFETY: we did is_empty check above, this is ok.
     if files[0].location.is_presigned() {
         let file_opener = Box::new(PresignedUrlOpener::new(
-            1024,
+            batch_size,
             physical_schema.clone(),
             predicate,
         ));
@@ -279,21 +307,11 @@ async fn read_parquet_files_impl(
         let store = store.clone();
         let schema = physical_schema.clone();
         let predicate = predicate.clone();
-        async move {
-            open_parquet_file(
-                store,
-                schema,
-                predicate,
-                None,
-                super::DEFAULT_BATCH_SIZE,
-                file,
-            )
-            .await
-        }
+        async move { open_parquet_file(store, schema, predicate, None, batch_size, file).await }
     });
     // create a stream from that iterator which buffers up to `buffer_size` futures at a time
     let result_stream = stream::iter(file_futures)
-        .buffered(super::DEFAULT_BUFFER_SIZE)
+        .buffered(buffer_size)
         .try_flatten()
         .map_ok(|record_batch| -> Box<dyn EngineData> {
             Box::new(ArrowEngineData::new(record_batch))
@@ -309,13 +327,29 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        self.read_parquet_files_with_cancellation(files, physical_schema, predicate, None)
+    }
+
+    fn read_parquet_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
         let future = read_parquet_files_impl(
             self.store.clone(),
             files.to_vec(),
             physical_schema,
             predicate,
+            self.buffer_size.get(),
+            self.batch_size.get(),
         );
-        super::stream_future_to_iter(self.task_executor.clone(), future)
+        super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            future,
+            cancellation_token,
+        )
     }
 
     /// Writes engine data to a Parquet file at the specified location.
@@ -372,11 +406,19 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        self.read_parquet_footer_with_cancellation(file, None)
+    }
+
+    fn read_parquet_footer_with_cancellation(
+        &self,
+        file: &FileMeta,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<ParquetFooter> {
         let store = self.store.clone();
         let location = file.location.clone();
         let file_size = file.size;
 
-        self.task_executor.block_on(async move {
+        let footer_future = async move {
             let metadata = if location.is_presigned() {
                 let client = reqwest::Client::new();
                 let response =
@@ -394,11 +436,16 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?
             };
 
-            let schema = StructType::try_from_arrow(metadata.schema().as_ref())
-                .map(Arc::new)
-                .map_err(Error::Arrow)?;
+            let schema = Arc::new(StructType::try_from_arrow(metadata.schema().as_ref())?);
             Ok(ParquetFooter { schema })
-        })
+        };
+
+        // Race the footer read against cancellation so a cancelled request stops promptly.
+        match cancellation_token {
+            Some(token) => super::block_on_or_cancelled(&self.task_executor, token, footer_future)
+                .unwrap_or(Err(Error::Cancelled)),
+            None => self.task_executor.block_on(footer_future),
+        }
     }
 }
 
@@ -440,35 +487,22 @@ async fn open_parquet_file(
         }
     };
 
-    let reader_options = reader_options();
-    let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options.clone()).await?;
-    let parquet_schema = metadata.schema();
-    let (indices, requested_ordering) = get_requested_indices(&table_schema, parquet_schema)?;
-    let mut builder =
-        ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_options).await?;
-    if let Some(mask) = generate_mask(
-        &table_schema,
-        parquet_schema,
-        builder.parquet_schema(),
-        &indices,
-    ) {
-        builder = builder.with_projection(mask)
-    }
+    let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?;
+    let (requested_ordering, mask) = parquet_read_plan(&table_schema, &metadata)?;
 
-    // Only create RowIndexBuilder if row indexes are actually needed
     let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
-        .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
+        .then(|| RowIndexBuilder::new(metadata.metadata().row_groups()));
 
-    // Filter row groups and row indexes if a predicate is provided
-    if let Some(ref predicate) = predicate {
-        builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
-    }
-    if let Some(limit) = limit {
-        builder = builder.with_limit(limit)
-    }
+    let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata)
+        .fold_with(mask, ParquetRecordBatchStreamBuilder::with_projection)
+        .fold_with(predicate, |builder, predicate| {
+            builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut())
+        })
+        .fold_with(limit, ParquetRecordBatchStreamBuilder::with_limit)
+        .with_batch_size(batch_size);
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
-    let stream = builder.with_batch_size(batch_size).build()?;
+    let stream = builder.build()?;
 
     let stream = stream.map(move |rbr| {
         fixup_parquet_read(
@@ -520,36 +554,20 @@ impl FileOpener for PresignedUrlOpener {
         Ok(Box::pin(async move {
             // fetch the file from the interweb
             let reader = client.get(&file_location).send().await?.bytes().await?;
-            let reader_options = reader_options();
-            let metadata = ArrowReaderMetadata::load(&reader, reader_options.clone())?;
-            let parquet_schema = metadata.schema();
-            let (indices, requested_ordering) =
-                get_requested_indices(&table_schema, parquet_schema)?;
+            let metadata = ArrowReaderMetadata::load(&reader, reader_options())?;
+            let (requested_ordering, mask) = parquet_read_plan(&table_schema, &metadata)?;
 
-            let mut builder =
-                ParquetRecordBatchReaderBuilder::try_new_with_options(reader, reader_options)?;
-            if let Some(mask) = generate_mask(
-                &table_schema,
-                parquet_schema,
-                builder.parquet_schema(),
-                &indices,
-            ) {
-                builder = builder.with_projection(mask)
-            }
-
-            // Only create RowIndexBuilder if row indexes are actually needed
             let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
-                .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
+                .then(|| RowIndexBuilder::new(metadata.metadata().row_groups()));
 
-            // Filter row groups and row indexes if a predicate is provided
-            if let Some(ref predicate) = predicate {
-                builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
-            }
-            if let Some(limit) = limit {
-                builder = builder.with_limit(limit)
-            }
-
-            let reader = builder.with_batch_size(batch_size).build()?;
+            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, metadata)
+                .fold_with(mask, ParquetRecordBatchReaderBuilder::with_projection)
+                .fold_with(predicate, |builder, predicate| {
+                    builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut())
+                })
+                .fold_with(limit, ParquetRecordBatchReaderBuilder::with_limit)
+                .with_batch_size(batch_size)
+                .build()?;
 
             let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
             let stream = futures::stream::iter(reader);
@@ -573,20 +591,30 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::slice;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use bytes::Bytes;
     use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
     use delta_kernel::arrow::array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
         Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
-        TimestampMicrosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray,
     };
-    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use delta_kernel::arrow::datatypes::{
+        DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit,
+    };
     use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
-    use delta_kernel::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
+    use delta_kernel::schema::{
+        schema, schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    };
     use delta_kernel::EngineData;
     use delta_kernel_default_engine_test_utils::{
         assert_result_error_with_message, current_time_ms,
@@ -605,6 +633,90 @@ mod tests {
     use super::*;
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DEFAULT_BATCH_SIZE;
+
+    fn long_schema(name: &str) -> StructType {
+        schema! { nullable (name): LONG }
+    }
+
+    /// Test `ObjectStore` that counts footer fetches. `get_opts` (footer range GETs) is counted;
+    /// column-chunk data goes through `get_ranges` and is not counted, so the count isolates
+    /// footer reads.
+    #[derive(Debug)]
+    struct GetOptsCountingStore<T: ObjectStore> {
+        inner: T,
+        get_opts_count: AtomicUsize,
+    }
+
+    impl<T: ObjectStore> GetOptsCountingStore<T> {
+        fn new(inner: T) -> Self {
+            Self {
+                inner,
+                get_opts_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn get_opts_count(&self) -> usize {
+            self.get_opts_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl<T: ObjectStore> std::fmt::Display for GetOptsCountingStore<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GetOptsCountingStore({})", self.get_opts_count())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<T: ObjectStore> delta_kernel::object_store::ObjectStore for GetOptsCountingStore<T> {
+        // ===== The method we instrument: count footer-fetch GETs =====
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            self.get_opts_count.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_opts(location, options).await
+        }
+
+        // ===== Everything else: behavior unchanged, delegate to inner =====
+        // Overridden (not inherited) so column-chunk data reads delegate straight to inner and
+        // stay off the get_opts counter.
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     async fn read_all_rows_helper(file_meta: FileMeta) -> DeltaResult<Vec<RecordBatch>> {
         let store = Arc::new(LocalFileSystem::new());
@@ -666,6 +778,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_open_parquet_file_fetches_footer_once() {
+        let path = std::fs::canonicalize(PathBuf::from(
+            "../kernel/tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+        )).unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let url = Url::from_file_path(&path).unwrap();
+        let location = Path::from_url_path(url.path()).unwrap();
+
+        // Baseline: how many `get_opts` calls a single footer load makes (one or more range GETs,
+        // depending on parquet version). The reader builder must not exceed this.
+        let baseline_store = Arc::new(GetOptsCountingStore::new(LocalFileSystem::new()));
+        let mut reader =
+            ParquetObjectReader::new(baseline_store.clone(), location).with_file_size(file_size);
+        let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options())
+            .await
+            .unwrap();
+        let footer_load_gets = baseline_store.get_opts_count();
+        assert!(
+            footer_load_gets > 0,
+            "footer load should issue at least one GET"
+        );
+        let physical_schema = Arc::new(metadata.schema().clone().try_into_kernel().unwrap());
+
+        // `open_parquet_file` must reuse the loaded footer rather than re-fetch it when building
+        // the reader, so its footer GETs equal a single load, not double.
+        let counting_store = Arc::new(GetOptsCountingStore::new(LocalFileSystem::new()));
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: file_size,
+        };
+        let stream = open_parquet_file(
+            counting_store.clone(),
+            physical_schema,
+            None,
+            None,
+            DEFAULT_BATCH_SIZE,
+            file_meta,
+        )
+        .await
+        .unwrap();
+        let _batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        assert_eq!(
+            counting_store.get_opts_count(),
+            footer_load_gets,
+            "footer should be fetched once, not re-fetched when constructing the reader"
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_parquet_files() {
         let store = Arc::new(LocalFileSystem::new());
 
@@ -703,6 +866,96 @@ mod tests {
 
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 10);
+    }
+
+    // A Parquet file can physically store TIMESTAMP(MILLIS) (for example, checkpoint stats
+    // written by a non-kernel writer). End to end, the default engine must (a) convert the
+    // millisecond footer schema to the kernel's microsecond TIMESTAMP / TIMESTAMP_NTZ, and
+    // (b) rescale the values to microseconds (x1000) when reading them into that schema.
+    #[tokio::test]
+    async fn test_read_millisecond_timestamps() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("ms_timestamps.parquet");
+
+        // 1700000000123 ms since epoch -> 1_700_000_000_123_000 us.
+        let ms: i64 = 1_700_000_000_123;
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(
+                "ts_utc",
+                ArrowDataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new(
+                "ts_ntz",
+                ArrowDataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![ms]).with_timezone("UTC"))
+                    as Arc<dyn Array>,
+                Arc::new(TimestampMillisecondArray::from(vec![ms])) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap();
+
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&file_path).unwrap(),
+            arrow_schema,
+            None,
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        let file_meta = FileMeta {
+            location: Url::from_file_path(&file_path).unwrap(),
+            last_modified: 0,
+            size: file_size,
+        };
+
+        let handler = DefaultParquetHandler::new(
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(TokioBackgroundExecutor::new()),
+        );
+
+        // (a) Footer schema: millisecond timestamps convert to the kernel's microsecond types.
+        let footer = handler.read_parquet_footer(&file_meta).unwrap();
+        assert_eq!(
+            footer.schema.field("ts_utc").unwrap().data_type(),
+            &DataType::TIMESTAMP
+        );
+        assert_eq!(
+            footer.schema.field("ts_ntz").unwrap().data_type(),
+            &DataType::TIMESTAMP_NTZ
+        );
+
+        // (b) Data path: values are rescaled ms -> us when read into the microsecond schema.
+        let data: Vec<RecordBatch> = handler
+            .read_parquet_files(slice::from_ref(&file_meta), footer.schema.clone(), None)
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 1);
+        let expected_us = ms * 1_000;
+        for col_idx in 0..2 {
+            let col = data[0]
+                .column(col_idx)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            assert_eq!(
+                col.value(0),
+                expected_us,
+                "column {col_idx} should be rescaled to us"
+            );
+        }
     }
 
     #[rstest::rstest]
@@ -807,9 +1060,15 @@ mod tests {
             )])
             .unwrap(),
         ));
+        let physical_schema = long_schema("a");
 
         let write_metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(
+                &Url::parse("memory:///data/").unwrap(),
+                data,
+                &[],
+                &physical_schema,
+            )
             .await
             .unwrap();
 
@@ -886,10 +1145,16 @@ mod tests {
             )])
             .unwrap(),
         ));
+        let physical_schema = long_schema("a");
 
         assert_result_error_with_message(
             parquet_handler
-                .write_parquet(&Url::parse("memory:///data").unwrap(), data, &[])
+                .write_parquet(
+                    &Url::parse("memory:///data").unwrap(),
+                    data,
+                    &[],
+                    &physical_schema,
+                )
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );
@@ -957,6 +1222,59 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 3);
         assert_eq!(data[0].num_columns(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_read_parquet_files_respects_batch_size() {
+        let store = Arc::new(InMemory::new());
+        let writer: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "x",
+                Arc::new(Int64Array::from((0..10).collect::<Vec<_>>())) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let file_url = Url::parse("memory:///test/batch_size.parquet").unwrap();
+        writer
+            .write_parquet_file(file_url.clone(), Box::new(std::iter::once(Ok(engine_data))))
+            .unwrap();
+
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let metadata = store.head(&path).await.unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+        let file_meta = FileMeta {
+            location: file_url,
+            last_modified: 0,
+            size: metadata.size,
+        };
+
+        // With a batch size of 4, the 10-row file should be split into batches of 4, 4, 2.
+        let handler =
+            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()))
+                .with_batch_size(NonZero::new(4).unwrap());
+        let data: Vec<RecordBatch> = handler
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        let row_counts: Vec<usize> = data.iter().map(|b| b.num_rows()).collect();
+        assert_eq!(row_counts, vec![4, 4, 2]);
     }
 
     #[tokio::test]
@@ -1340,21 +1658,18 @@ mod tests {
         writer.close().unwrap();
 
         // Create kernel schema with DIFFERENT names but SAME field IDs
-        let kernel_schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::new("user_id", delta_kernel::schema::DataType::LONG, false)
+        let kernel_schema = schema_ref! {
+            (StructField::new("user_id", delta_kernel::schema::DataType::LONG, false)
                     .with_metadata([(
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(1),
-                    )]),
-                StructField::new("user_name", delta_kernel::schema::DataType::STRING, false)
+                    )])),
+            (StructField::new("user_name", delta_kernel::schema::DataType::STRING, false)
                     .with_metadata([(
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(2),
-                    )]),
-            ])
-            .unwrap(),
-        );
+                    )])),
+        };
 
         // Read using kernel schema with different column names
         let store = Arc::new(LocalFileSystem::new());
@@ -1415,8 +1730,14 @@ mod tests {
             )])
             .unwrap(),
         ));
+        let physical_schema = long_schema("a");
         let metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(
+                &Url::parse("memory:///data/").unwrap(),
+                data,
+                &[],
+                &physical_schema,
+            )
             .await
             .unwrap();
 

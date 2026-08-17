@@ -165,28 +165,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Arrow parquet reader cannot annotate Unknown logical type from BOOLEAN physical type",
-        &[
-            "void_001_void_top_level/specs/void_001_void_top_level_read_all",
-            "void_002_void_nested_struct/specs/void_002_void_nested_struct_read_all",
-            "void_005_void_schema_evolution/specs/void_005_void_schema_evolution_read_all",
-            "void_006_void_multiple_columns/specs/void_006_void_multiple_columns_read_all",
-            "void_007_void_with_backticks/specs/void_007_void_with_backticks_read_all",
-        ],
-    ),
-    (
-        "Interval types not supported in schema deserialization",
-        &[
-            "intv_001_interval_ym_basic/",
-            "intv_002_interval_dt_basic/",
-            "intv_003_interval_partitioned/",
-            "intv_004_interval_negative/",
-            "intv_005_interval_mixed/",
-            "intv_boundary_values/",
-            "intv_sub_second/",
-        ],
-    ),
-    (
         "Cannot fall back to log replay when checkpoint files are missing or incomplete",
         &[
             "corrupt_incomplete_multipart_checkpoint/",

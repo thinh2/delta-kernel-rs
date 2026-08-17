@@ -47,7 +47,7 @@ pub fn insert_url_handler(
 ///
 /// ```rust
 /// # use url::Url;
-/// # use delta_kernel::engine::default::storage::store_from_url;
+/// # use delta_kernel_default_engine::storage::store_from_url;
 /// # use delta_kernel::DeltaResult;
 /// # fn example() -> DeltaResult<()> {
 /// let url = Url::parse("file:///path/to/table")?;
@@ -71,7 +71,7 @@ pub fn store_from_url(url: &Url) -> delta_kernel::DeltaResult<Arc<dyn ObjectStor
 /// ```rust
 /// # use url::Url;
 /// # use std::collections::HashMap;
-/// # use delta_kernel::engine::default::storage::store_from_url_opts;
+/// # use delta_kernel_default_engine::storage::store_from_url_opts;
 /// # use delta_kernel::DeltaResult;
 /// # fn example() -> DeltaResult<()> {
 /// let url = Url::parse("s3://my-bucket/path/to/table")?;
@@ -108,7 +108,6 @@ where
     Ok(Arc::new(store))
 }
 
-#[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

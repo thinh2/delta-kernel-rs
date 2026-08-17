@@ -45,6 +45,17 @@ impl Drop for FileReadResultIterator {
     }
 }
 
+impl FileReadResultIterator {
+    /// Wrap a kernel `EngineData` iterator (paired with the engine that produced it) into a handle
+    /// the engine can drain via [`read_result_next`] and release with [`free_read_result_iter`].
+    pub(crate) fn into_handle(
+        data: FileDataReadResultIterator,
+        engine: Arc<dyn ExternEngine>,
+    ) -> Handle<ExclusiveFileReadResultIterator> {
+        Box::new(FileReadResultIterator { data, engine }).into()
+    }
+}
+
 /// Call the engine back with the next `EngineData` batch read by Parquet/Json handler. The
 /// _engine_ "owns" the data that is passed into the `engine_visitor`, since it is allocated by the
 /// `Engine` being used for log-replay. If the engine wants the kernel to free this data, it _must_
@@ -215,10 +226,8 @@ fn evaluate_expression_impl(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use delta_kernel::schema::{DataType, StructField, StructType};
-    use delta_kernel::Expression;
+    use delta_kernel::expressions::lit;
+    use delta_kernel::schema::schema_ref;
 
     use super::{free_expression_evaluator, new_expression_evaluator};
     use crate::ffi_test_utils::ok_or_panic;
@@ -229,10 +238,8 @@ mod tests {
     #[test]
     fn test_new_expression_evaluator() {
         let engine = get_default_engine("memory:///doesntmatter/foo");
-        let in_schema = Arc::new(
-            StructType::try_new(vec![StructField::new("a", DataType::LONG, true)]).unwrap(),
-        );
-        let expr = Expression::literal(1);
+        let in_schema = schema_ref! { nullable "a": LONG };
+        let expr = lit(1);
         let output_type: Handle<SharedSchema> = in_schema.clone().into();
         let in_schema_handle: Handle<SharedSchema> = in_schema.into();
         unsafe {

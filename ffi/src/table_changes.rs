@@ -343,10 +343,8 @@ mod tests {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::DynObjectStore;
-    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
-    use delta_kernel::object_store::ObjectStoreExt as _;
-    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
+    use delta_kernel::schema::{schema_ref, StructType};
     use delta_kernel::Engine;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use delta_kernel_ffi::engine_data::get_engine_data;
@@ -467,21 +465,21 @@ mod tests {
 
     pub fn generate_batch_with_id(start_i: i32) -> Result<RecordBatch, ArrowError> {
         generate_batch(vec![
-            ("id", vec![start_i, start_i + 1, start_i + 2].into_array()),
-            ("val", vec!["a", "b", "c"].into_array()),
+            (
+                "id",
+                vec![start_i, start_i + 1, start_i + 2].into_arrow_array(),
+            ),
+            ("val", vec!["a", "b", "c"].into_arrow_array()),
         ])
     }
 
     pub fn get_batch_schema() -> Arc<StructType> {
-        Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("id", DataType::INTEGER),
-                StructField::nullable("val", DataType::STRING),
-                StructField::nullable("_change_type", DataType::STRING),
-                StructField::nullable("_commit_version", DataType::INTEGER),
-            ])
-            .unwrap(),
-        )
+        schema_ref! {
+            nullable "id": INTEGER,
+            nullable "val": STRING,
+            nullable "_change_type": STRING,
+            nullable "_commit_version": INTEGER,
+        }
     }
 
     fn check_columns_in_schema(fields: &[&str], schema: &StructType) -> bool {
@@ -795,12 +793,12 @@ mod tests {
         let batches: Vec<RecordBatch> = batches.into_iter().flatten().collect();
         let filtered_batches: Vec<RecordBatch> = filter_batches(batches);
 
-        let table_schema = Arc::new(StructType::try_new(vec![
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("val", DataType::STRING),
-            StructField::nullable("_change_type", DataType::STRING),
-            StructField::nullable("_commit_version", DataType::INTEGER),
-        ])?);
+        let table_schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "val": STRING,
+            nullable "_change_type": STRING,
+            nullable "_commit_version": INTEGER,
+        };
         let expected = &ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(table_schema.as_ref().try_into_arrow()?),
             vec![

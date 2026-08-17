@@ -68,7 +68,7 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, Error as ObjectStoreError, ObjectStoreExt as _};
-use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, PrimitiveType, SchemaRef, StructType};
 use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
@@ -325,7 +325,7 @@ impl LogState {
     }
 
     /// Versions at which CRC files are written, in ascending order.
-    pub(crate) fn crcs_at(&self) -> &[u64] {
+    pub fn crcs_at(&self) -> &[u64] {
         &self.crcs_at
     }
 
@@ -713,6 +713,33 @@ impl TableConfig {
         ));
         self
     }
+
+    /// Set `delta.dataSkippingNumIndexedCols` to `n`: stats are capped to the first `n` leaf
+    /// columns. `-1` means all columns; the protocol default when unset is 32.
+    pub fn num_data_skipping_indexed_cols(mut self, n: i64) -> Self {
+        self.table_properties
+            .push(("delta.dataSkippingNumIndexedCols".into(), n.to_string()));
+        self
+    }
+
+    /// Set `delta.dataSkippingStatsColumns` to a comma-separated list of column names.
+    /// Per the Delta spec this takes precedence over `dataSkippingNumIndexedCols`. The
+    /// builder joins names verbatim and does not validate them; entries that don't
+    /// resolve in the active schema are silently skipped by kernel (with a warning).
+    pub fn data_skipping_stats_columns<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let joined = columns
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.table_properties
+            .push(("delta.dataSkippingStatsColumns".into(), joined));
+        self
+    }
 }
 
 impl fmt::Display for TableConfig {
@@ -735,8 +762,20 @@ impl fmt::Display for TableConfig {
     }
 }
 
-// Canonical sweep rows for the TableConfig axis. These toggle only the *checkpoint*
-// stats encoding -- per-commit add-file stats are always written and unaffected.
+// Canonical sweep rows for the `TableConfig` axis. The sweep covers three checkpoint
+// stats encodings plus six data-skipping rows: three count-based (`numIndexedCols`)
+// values and three named-columns (`dataSkippingStatsColumns`) shapes, so each knob
+// varies across the full LogState x FeatureSet x DataLayout x VersionTarget cross
+// product. Per-commit add-file stats are always written and unaffected by the
+// checkpoint format flags.
+
+/// Stats-column names that span the schemas used by [`DataLayoutConfig`]: `int_col`
+/// exists in [`default_schema`], `value` in [`partitioned_schema`] and
+/// [`clustered_schema`]. Kernel silently skips entries that don't exist in the active
+/// schema, so each layout collects stats on whichever entry matches.
+pub(crate) const STATS_COLUMNS_BY_NAME: &[&str] = &["int_col", "value"];
+
+// === Checkpoint stats encoding rows ===
 
 pub fn checkpoint_json_stats() -> TableConfig {
     TableConfig::new()
@@ -750,10 +789,53 @@ pub fn checkpoint_struct_stats() -> TableConfig {
         .write_stats_as_struct(true)
 }
 
+/// Disables both checkpoint stats encodings; per-commit add-file stats are still written.
 pub fn no_checkpoint_stats() -> TableConfig {
     TableConfig::new()
         .write_stats_as_json(false)
         .write_stats_as_struct(false)
+}
+
+// === numIndexedCols rows (count-based data skipping) ===
+
+/// `numIndexedCols = 0`: zero leaf columns get stats.
+pub fn num_indexed_cols_zero() -> TableConfig {
+    TableConfig::new().num_data_skipping_indexed_cols(0)
+}
+
+/// `numIndexedCols = 2`: cap stats to the first 2 leaf columns.
+pub fn num_indexed_cols_narrow() -> TableConfig {
+    TableConfig::new().num_data_skipping_indexed_cols(2)
+}
+
+/// `numIndexedCols = -1`: stats on every leaf column.
+pub fn num_indexed_cols_all() -> TableConfig {
+    TableConfig::new().num_data_skipping_indexed_cols(-1)
+}
+
+// === dataSkippingStatsColumns rows (named-cols data skipping) ===
+
+/// `dataSkippingStatsColumns = []`: named-cols knob set, no columns listed.
+pub fn stats_columns_empty() -> TableConfig {
+    TableConfig::new().data_skipping_stats_columns(std::iter::empty::<&str>())
+}
+
+/// `dataSkippingStatsColumns` listing names that match at least one column in every
+/// `DataLayoutConfig` schema (kernel silently skips entries that don't match), in reverse
+/// schema order to exercise list-order preservation through write + read.
+pub fn stats_columns_reordered() -> TableConfig {
+    TableConfig::new().data_skipping_stats_columns(STATS_COLUMNS_BY_NAME.iter().rev().copied())
+}
+
+// === Composers: enable a checkpoint stats encoding on a data-skipping config ===
+// Each enables only its own encoding, so composing both writes stats in both encodings.
+
+pub fn with_json_stats(cfg: TableConfig) -> TableConfig {
+    cfg.write_stats_as_json(true)
+}
+
+pub fn with_struct_stats(cfg: TableConfig) -> TableConfig {
+    cfg.write_stats_as_struct(true)
 }
 
 // ===========================================================================
@@ -906,24 +988,24 @@ impl fmt::Display for DataLayoutConfig {
 ///
 /// All columns are nullable. Follow-up: add non-nullable variants to test NOT NULL handling.
 pub fn partitioned_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
+    schema_ref! {
         // Partition-candidate columns (all valid partition types, matches write::partitioned)
-        StructField::new("part_bool", DataType::BOOLEAN, true),
-        StructField::new("part_byte", DataType::BYTE, true),
-        StructField::new("part_short", DataType::SHORT, true),
-        StructField::new("part_int", DataType::INTEGER, true),
-        StructField::new("part_long", DataType::LONG, true),
-        StructField::new("part_float", DataType::FLOAT, true),
-        StructField::new("part_double", DataType::DOUBLE, true),
-        StructField::new("part_string", DataType::STRING, true),
-        StructField::new("part_binary", DataType::BINARY, true),
-        StructField::new("part_date", DataType::DATE, true),
-        StructField::new("part_ts", DataType::TIMESTAMP, true),
-        StructField::new("part_ts_ntz", DataType::TIMESTAMP_NTZ, true),
-        StructField::new("part_decimal", DataType::decimal(10, 2).unwrap(), true),
+        nullable "part_bool": BOOLEAN,
+        nullable "part_byte": BYTE,
+        nullable "part_short": SHORT,
+        nullable "part_int": INTEGER,
+        nullable "part_long": LONG,
+        nullable "part_float": FLOAT,
+        nullable "part_double": DOUBLE,
+        nullable "part_string": STRING,
+        nullable "part_binary": BINARY,
+        nullable "part_date": DATE,
+        nullable "part_ts": TIMESTAMP,
+        nullable "part_ts_ntz": TIMESTAMP_NTZ,
+        nullable "part_decimal": (DataType::decimal(10, 2).unwrap()),
         // Non-partition data column (required: at least one non-partition column)
-        StructField::new("value", DataType::INTEGER, true),
-    ]))
+        nullable "value": INTEGER,
+    }
 }
 
 /// Schema with all stats-eligible primitive types for clustering. Boolean and Binary are
@@ -932,22 +1014,22 @@ pub fn partitioned_schema() -> SchemaRef {
 ///
 /// All columns are nullable. Follow-up: add non-nullable variants to test NOT NULL handling.
 pub fn clustered_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
+    schema_ref! {
         // Clustering-eligible columns (stats-eligible primitive types)
-        StructField::new("clust_byte", DataType::BYTE, true),
-        StructField::new("clust_short", DataType::SHORT, true),
-        StructField::new("clust_int", DataType::INTEGER, true),
-        StructField::new("clust_long", DataType::LONG, true),
-        StructField::new("clust_float", DataType::FLOAT, true),
-        StructField::new("clust_double", DataType::DOUBLE, true),
-        StructField::new("clust_string", DataType::STRING, true),
-        StructField::new("clust_date", DataType::DATE, true),
-        StructField::new("clust_ts", DataType::TIMESTAMP, true),
-        StructField::new("clust_ts_ntz", DataType::TIMESTAMP_NTZ, true),
-        StructField::new("clust_decimal", DataType::decimal(10, 2).unwrap(), true),
+        nullable "clust_byte": BYTE,
+        nullable "clust_short": SHORT,
+        nullable "clust_int": INTEGER,
+        nullable "clust_long": LONG,
+        nullable "clust_float": FLOAT,
+        nullable "clust_double": DOUBLE,
+        nullable "clust_string": STRING,
+        nullable "clust_date": DATE,
+        nullable "clust_ts": TIMESTAMP,
+        nullable "clust_ts_ntz": TIMESTAMP_NTZ,
+        nullable "clust_decimal": (DataType::decimal(10, 2).unwrap()),
         // Non-clustering data column
-        StructField::new("value", DataType::INTEGER, true),
-    ]))
+        nullable "value": INTEGER,
+    }
 }
 
 // Canonical sweep rows for the DataLayoutConfig axis.
@@ -980,6 +1062,15 @@ pub enum VersionTarget {
     AtVersion(u64),
     /// Load at `from`, then incrementally update to latest.
     IncrementalToLatest { from: u64 },
+    /// Load at `from`, then incrementally update to a specific target `to`. Exercises the
+    /// `Snapshot::builder_from(base).at_version(to)` path with `to <= latest`. Requires
+    /// `from <= to`.
+    IncrementalFrom { from: u64, to: u64 },
+    /// Time travel by timestamp: resolves `timestamp` (milliseconds since Unix epoch) to a
+    /// version via [`history_manager::latest_version_as_of`], then loads that version.
+    ///
+    /// [`history_manager::latest_version_as_of`]: delta_kernel::history_manager::latest_version_as_of
+    AtTimestamp(i64),
 }
 
 impl fmt::Display for VersionTarget {
@@ -990,6 +1081,10 @@ impl fmt::Display for VersionTarget {
             VersionTarget::IncrementalToLatest { from } => {
                 write!(f, "incremental({from}->latest)")
             }
+            VersionTarget::IncrementalFrom { from, to } => {
+                write!(f, "incremental({from}->{to})")
+            }
+            VersionTarget::AtTimestamp(ts) => write!(f, "at_timestamp({ts})"),
         }
     }
 }
@@ -1002,10 +1097,29 @@ pub fn version_latest() -> VersionTarget {
 pub fn version_at_mid() -> VersionTarget {
     VersionTarget::AtVersion(DEFAULT_SWEEP_MID_VERSION)
 }
-pub fn version_incremental_to_latest() -> VersionTarget {
+pub fn version_incremental_from_mid_to_latest() -> VersionTarget {
     VersionTarget::IncrementalToLatest {
         from: DEFAULT_SWEEP_MID_VERSION,
     }
+}
+/// Incremental update from `mid` to `latest - 1`. The non-latest `to` exercises the
+/// partial-replay path that `version_incremental_from_mid_to_latest()` cannot reach, since
+/// updating to latest is indistinguishable from a non-incremental load.
+pub fn version_incremental_from_mid_to_pre_latest() -> VersionTarget {
+    VersionTarget::IncrementalFrom {
+        from: DEFAULT_SWEEP_MID_VERSION,
+        to: DEFAULT_SWEEP_LATEST_VERSION - 1,
+    }
+}
+/// Timestamp travel using `i64::MAX`, which always resolves to the latest version (every
+/// commit's timestamp is below `i64::MAX`). This is a smoke test that the timestamp
+/// conversion path runs without error across the sweep, not a resolution-correctness
+/// check: `InMemory` collapses successive `put` timestamps to a single millisecond, so the
+/// sweep can't reach an intermediate version. Resolution to an intermediate version is
+/// covered by `test_at_timestamp_resolves_to_intermediate_version`, which sets commit
+/// modification times explicitly on the local filesystem.
+pub fn version_at_timestamp_max() -> VersionTarget {
+    VersionTarget::AtTimestamp(i64::MAX)
 }
 
 // ===========================================================================
@@ -1439,8 +1553,10 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
             Arc::new(Date32Array::from(values))
         }
         ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            // The sub-millisecond component keeps stats-formatting tests honest: a whole-second
+            // value cannot distinguish a three-digit fraction from an elided one.
             let values: Vec<i64> = (0..rows)
-                .map(|i| (18000 + base + i as i32) as i64 * 86_400_000_000)
+                .map(|i| (18000 + base + i as i32) as i64 * 86_400_000_000 + 298_677)
                 .collect();
             let array = TimestampMicrosecondArray::from(values);
             match tz {
@@ -1594,6 +1710,30 @@ macro_rules! build_snapshot {
                     .unwrap();
                 Snapshot::builder_from(base).build($engine).unwrap()
             }
+            $crate::table_builder::VersionTarget::IncrementalFrom { from, to } => {
+                let base = Snapshot::builder_for($table_root)
+                    .at_version(*from)
+                    .build($engine)
+                    .unwrap();
+                Snapshot::builder_from(base)
+                    .at_version(*to)
+                    .build($engine)
+                    .unwrap()
+            }
+            $crate::table_builder::VersionTarget::AtTimestamp(ts) => {
+                let latest = Snapshot::builder_for($table_root).build($engine).unwrap();
+                let commit = ::delta_kernel::history_manager::latest_version_as_of(
+                    &latest,
+                    $engine,
+                    *ts,
+                    ::delta_kernel::history_manager::HistoryCommitType::Recreatable,
+                )
+                .unwrap();
+                Snapshot::builder_for($table_root)
+                    .at_version(commit.version)
+                    .build($engine)
+                    .unwrap()
+            }
         }
     };
 }
@@ -1668,36 +1808,43 @@ fn generate_partition_values(
 /// Generate a deterministic [`Scalar`] partition value for the given data type.
 fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
     match data_type {
-        DataType::Primitive(p) => match p {
-            PrimitiveType::Boolean => Scalar::Boolean(seed.is_multiple_of(2)),
-            PrimitiveType::Byte => Scalar::Byte((seed % 100) as i8),
-            PrimitiveType::Short => Scalar::Short((seed % 100) as i16),
-            PrimitiveType::Integer => Scalar::Integer((seed % 100) as i32),
-            PrimitiveType::Long => Scalar::Long((seed * 1000) as i64),
-            PrimitiveType::Float => Scalar::Float(seed as f32 * 0.5),
-            PrimitiveType::Double => Scalar::Double(seed as f64 * 0.25),
-            PrimitiveType::String => Scalar::String(format!("part_{seed}")),
-            PrimitiveType::Binary => Scalar::Binary(format!("bin_{seed}").into_bytes()),
-            PrimitiveType::Date => {
-                // Days since epoch (1970-01-01)
-                Scalar::Date(18000 + seed as i32)
+        DataType::Primitive(p) => {
+            #[allow(unreachable_patterns)]
+            match p {
+                PrimitiveType::Boolean => Scalar::Boolean(seed.is_multiple_of(2)),
+                PrimitiveType::Byte => Scalar::Byte((seed % 100) as i8),
+                PrimitiveType::Short => Scalar::Short((seed % 100) as i16),
+                PrimitiveType::Integer => Scalar::Integer((seed % 100) as i32),
+                PrimitiveType::Long => Scalar::Long((seed * 1000) as i64),
+                PrimitiveType::Float => Scalar::Float(seed as f32 * 0.5),
+                PrimitiveType::Double => Scalar::Double(seed as f64 * 0.25),
+                PrimitiveType::String => Scalar::String(format!("part_{seed}")),
+                PrimitiveType::Binary => Scalar::Binary(format!("bin_{seed}").into_bytes()),
+                PrimitiveType::Date => {
+                    // Days since epoch (1970-01-01)
+                    Scalar::Date(18000 + seed as i32)
+                }
+                PrimitiveType::Timestamp => {
+                    // Microseconds since epoch (UTC)
+                    Scalar::Timestamp((18000 + seed as i64) * 86_400_000_000)
+                }
+                PrimitiveType::TimestampNtz => {
+                    // Microseconds since epoch (no timezone)
+                    Scalar::TimestampNtz((18000 + seed as i64) * 86_400_000_000)
+                }
+                PrimitiveType::Decimal(dt) => {
+                    let scale_factor = 10i128.pow(dt.scale() as u32);
+                    let bits = seed as i128 * scale_factor;
+                    Scalar::decimal(bits, dt.precision(), dt.scale())
+                        .expect("test seed produced invalid decimal")
+                }
+                PrimitiveType::Void => panic!("void type is not a valid partition column"),
+                // Intervals are physical integers: months (year-month) / microseconds (day-time).
+                PrimitiveType::IntervalYearMonth => Scalar::IntervalYearMonth((seed % 100) as i32),
+                PrimitiveType::IntervalDayTime => Scalar::IntervalDayTime((seed * 1000) as i64),
+                other => panic!("{other:?} is not a valid partition column type"),
             }
-            PrimitiveType::Timestamp => {
-                // Microseconds since epoch (UTC)
-                Scalar::Timestamp((18000 + seed as i64) * 86_400_000_000)
-            }
-            PrimitiveType::TimestampNtz => {
-                // Microseconds since epoch (no timezone)
-                Scalar::TimestampNtz((18000 + seed as i64) * 86_400_000_000)
-            }
-            PrimitiveType::Decimal(dt) => {
-                let scale_factor = 10i128.pow(dt.scale() as u32);
-                let bits = seed as i128 * scale_factor;
-                Scalar::decimal(bits, dt.precision(), dt.scale())
-                    .expect("test seed produced invalid decimal")
-            }
-            PrimitiveType::Void => panic!("void type is not a valid partition column"),
-        },
+        }
         other => panic!("partition columns must be primitive types, got: {other:?}"),
     }
 }
@@ -1709,30 +1856,25 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
 /// Default schema with all Delta primitive types including TimestampNtz
 /// and a nested column type.
 pub(crate) fn default_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("bool_col", DataType::BOOLEAN, true),
-        StructField::new("byte_col", DataType::BYTE, true),
-        StructField::new("short_col", DataType::SHORT, true),
-        StructField::new("int_col", DataType::INTEGER, true),
-        StructField::new("long_col", DataType::LONG, true),
-        StructField::new("float_col", DataType::FLOAT, true),
-        StructField::new("double_col", DataType::DOUBLE, true),
-        StructField::new("string_col", DataType::STRING, true),
-        StructField::new("binary_col", DataType::BINARY, true),
-        StructField::new("date_col", DataType::DATE, true),
-        StructField::new("ts_col", DataType::TIMESTAMP, true),
-        StructField::new("ts_ntz_col", DataType::TIMESTAMP_NTZ, true),
-        StructField::new("decimal_col", DataType::decimal(10, 2).unwrap(), true),
-        StructField::new(
-            "nested_col",
-            DataType::try_struct_type([
-                StructField::nullable("a", DataType::LONG),
-                StructField::nullable("b", DataType::STRING),
-            ])
-            .unwrap(),
-            true,
-        ),
-    ]))
+    schema_ref! {
+        nullable "bool_col": BOOLEAN,
+        nullable "byte_col": BYTE,
+        nullable "short_col": SHORT,
+        nullable "int_col": INTEGER,
+        nullable "long_col": LONG,
+        nullable "float_col": FLOAT,
+        nullable "double_col": DOUBLE,
+        nullable "string_col": STRING,
+        nullable "binary_col": BINARY,
+        nullable "date_col": DATE,
+        nullable "ts_col": TIMESTAMP,
+        nullable "ts_ntz_col": TIMESTAMP_NTZ,
+        nullable "decimal_col": (DataType::decimal(10, 2).unwrap()),
+        nullable "nested_col": {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1773,7 +1915,9 @@ mod tests {
         #[values(
             VersionTarget::Latest,
             VersionTarget::AtVersion(2),
-            VersionTarget::IncrementalToLatest { from: 1 }
+            VersionTarget::IncrementalToLatest { from: 1 },
+            VersionTarget::IncrementalFrom { from: 1, to: 3 },
+            VersionTarget::AtTimestamp(i64::MAX),
         )]
         version_target: VersionTarget,
     ) {
@@ -1786,7 +1930,12 @@ mod tests {
         );
         let expected = match &version_target {
             VersionTarget::Latest | VersionTarget::IncrementalToLatest { .. } => 4,
+            VersionTarget::AtTimestamp(ts) if *ts == i64::MAX => 4,
             VersionTarget::AtVersion(v) => *v,
+            VersionTarget::IncrementalFrom { to, .. } => *to,
+            VersionTarget::AtTimestamp(ts) => {
+                panic!("test only uses AtTimestamp(i64::MAX), got {ts}")
+            }
         };
         assert_eq!(snap.version(), expected);
     }
@@ -1829,6 +1978,43 @@ mod tests {
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
         assert_eq!(snap.version(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn test_data_skipping_table_properties_in_metadata() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_table_config(
+                TableConfig::new()
+                    .num_data_skipping_indexed_cols(2)
+                    .data_skipping_stats_columns(["int_col", "long_col"]),
+            )
+            .build()?;
+        let config = read_metadata_configuration(table.store(), 0)?;
+        assert_eq!(
+            config
+                .get("delta.dataSkippingNumIndexedCols")
+                .map(|s| s.as_str()),
+            Some("2")
+        );
+        assert_eq!(
+            config
+                .get("delta.dataSkippingStatsColumns")
+                .map(|s| s.as_str()),
+            Some("int_col,long_col")
+        );
+        Ok(())
+    }
+
+    fn read_metadata_configuration(
+        store: &Arc<DynObjectStore>,
+        version: u64,
+    ) -> DeltaResult<std::collections::HashMap<String, String>> {
+        let store = store.clone();
+        block_on_sync(move || async move {
+            crate::read_metadata_configuration_from_store(store.as_ref(), version)
+                .await
+                .map_err(|e| delta_kernel::Error::generic(e.to_string()))
+        })
     }
 
     /// Verifies every common table config builds successfully.
@@ -2179,11 +2365,12 @@ mod tests {
 
     #[test]
     fn test_nested_struct_schema_round_trip() -> DeltaResult<()> {
-        let inner = DataType::try_struct_type([StructField::nullable("a", DataType::LONG)])?;
-        let schema: SchemaRef = Arc::new(StructType::try_new([
-            StructField::nullable("id", DataType::LONG),
-            StructField::nullable("inner", inner),
-        ])?);
+        let schema = schema_ref! {
+            nullable "id": LONG,
+            nullable "inner": {
+                nullable "a": LONG,
+            },
+        };
         let table = TestTableBuilder::new()
             .with_schema(schema.clone())
             .build()?;
