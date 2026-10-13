@@ -1,5 +1,7 @@
 use std::os::raw::c_void;
 
+#[cfg(feature = "geo-type-in-dev")]
+use delta_kernel::schema::EdgeInterpolationAlgorithm;
 use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 
 use crate::delta_types::FfiNullableStringMap;
@@ -8,6 +10,54 @@ use crate::delta_types::FfiNullableStringMapEntry;
 use crate::handle::Handle;
 use crate::scan::CMetadataMap;
 use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
+
+/// Algorithm used to interpolate edges between two vertices of a geography path.
+///
+/// Discriminants are part of the C ABI and never change. Kernel only passes valid values to
+/// engine callbacks. An engine passing this enum to kernel must use one of the declared values:
+/// any other value is undefined behavior.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum FfiEdgeInterpolationAlgorithm {
+    /// Edges are interpolated as geodesics on a sphere.
+    Spherical = 0,
+    /// Vincenty's formulae for geodesics on an ellipsoid.
+    Vincenty = 1,
+    /// Thomas's approximation for geodesics on an ellipsoid.
+    Thomas = 2,
+    /// Andoyer's approximation for geodesics on an ellipsoid.
+    Andoyer = 3,
+    /// Karney's algorithm for geodesics on an ellipsoid.
+    Karney = 4,
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl From<&EdgeInterpolationAlgorithm> for FfiEdgeInterpolationAlgorithm {
+    fn from(algorithm: &EdgeInterpolationAlgorithm) -> Self {
+        match algorithm {
+            EdgeInterpolationAlgorithm::Spherical => Self::Spherical,
+            EdgeInterpolationAlgorithm::Vincenty => Self::Vincenty,
+            EdgeInterpolationAlgorithm::Thomas => Self::Thomas,
+            EdgeInterpolationAlgorithm::Andoyer => Self::Andoyer,
+            EdgeInterpolationAlgorithm::Karney => Self::Karney,
+        }
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl From<FfiEdgeInterpolationAlgorithm> for EdgeInterpolationAlgorithm {
+    fn from(algorithm: FfiEdgeInterpolationAlgorithm) -> Self {
+        match algorithm {
+            FfiEdgeInterpolationAlgorithm::Spherical => Self::Spherical,
+            FfiEdgeInterpolationAlgorithm::Vincenty => Self::Vincenty,
+            FfiEdgeInterpolationAlgorithm::Thomas => Self::Thomas,
+            FfiEdgeInterpolationAlgorithm::Andoyer => Self::Andoyer,
+            FfiEdgeInterpolationAlgorithm::Karney => Self::Karney,
+        }
+    }
+}
 
 /// The `EngineSchemaVisitor` defines a visitor system to allow engines to build their own
 /// representation of a schema from a particular schema within kernel.
@@ -248,8 +298,8 @@ pub struct EngineSchemaVisitor {
     /// Visit a `geography` belonging to the list identified by `sibling_list_id`.
     ///
     /// `crs` is the coordinate reference system string for the geography type. `algorithm` is the
-    /// lowercase Delta protocol token for edge interpolation: `spherical`, `vincenty`, `thomas`,
-    /// `andoyer`, or `karney`.
+    /// edge interpolation algorithm and is always a declared [`FfiEdgeInterpolationAlgorithm`]
+    /// value.
     pub visit_geography: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
@@ -257,7 +307,7 @@ pub struct EngineSchemaVisitor {
         is_nullable: bool,
         metadata: &CMetadataMap,
         crs: KernelStringSlice,
-        algorithm: KernelStringSlice,
+        algorithm: FfiEdgeInterpolationAlgorithm,
     ),
 
     /// Visit a UDT with its physical type in the one-element `child_list_id` list.
@@ -465,11 +515,10 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             #[cfg(feature = "geo-type-in-dev")]
             DataType::Primitive(PrimitiveType::Geography(geography)) => {
                 let crs = geography.crs();
-                let algorithm = geography.algorithm().to_string();
                 call!(
                     visit_geography,
                     kernel_string_slice!(crs),
-                    kernel_string_slice!(algorithm)
+                    geography.algorithm().into()
                 )
             }
         }
@@ -523,7 +572,7 @@ mod tests {
             data_type: &'static str,
             is_nullable: bool,
             crs: &str,
-            algorithm: Option<&str>,
+            algorithm: Option<FfiEdgeInterpolationAlgorithm>,
         ) -> Self {
             Self {
                 name: name.to_string(),
@@ -532,7 +581,7 @@ mod tests {
                 children: None,
                 geo: Some(VisitedGeoType {
                     crs: crs.to_string(),
-                    algorithm: algorithm.map(str::to_string),
+                    algorithm,
                 }),
             }
         }
@@ -541,7 +590,7 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     struct VisitedGeoType {
         crs: String,
-        algorithm: Option<String>,
+        algorithm: Option<FfiEdgeInterpolationAlgorithm>,
     }
 
     #[derive(Default)]
@@ -694,18 +743,17 @@ mod tests {
         is_nullable: bool,
         _metadata: &CMetadataMap,
         crs: KernelStringSlice,
-        algorithm: KernelStringSlice,
+        algorithm: FfiEdgeInterpolationAlgorithm,
     ) {
         let builder = unsafe { &mut *(data as *mut TestSchemaBuilder) };
         let name = unsafe { String::try_from_slice(&name) }.unwrap();
         let crs = unsafe { String::try_from_slice(&crs) }.unwrap();
-        let algorithm = unsafe { String::try_from_slice(&algorithm) }.unwrap();
         builder.lists[sibling_list_id].push(VisitedField::geo(
             &name,
             "geography",
             is_nullable,
             &crs,
-            Some(&algorithm),
+            Some(algorithm),
         ));
     }
 
@@ -832,20 +880,80 @@ mod tests {
         );
         assert_eq!(
             builder.lists[0][1],
-            VisitedField::geo("geog", "geography", false, "OGC:CRS84", Some("spherical"))
+            VisitedField::geo(
+                "geog",
+                "geography",
+                false,
+                "OGC:CRS84",
+                Some(FfiEdgeInterpolationAlgorithm::Spherical)
+            )
         );
+    }
+
+    #[test]
+    fn edge_interpolation_algorithm_discriminants_are_stable() {
+        assert_eq!(FfiEdgeInterpolationAlgorithm::Spherical as u32, 0);
+        assert_eq!(FfiEdgeInterpolationAlgorithm::Vincenty as u32, 1);
+        assert_eq!(FfiEdgeInterpolationAlgorithm::Thomas as u32, 2);
+        assert_eq!(FfiEdgeInterpolationAlgorithm::Andoyer as u32, 3);
+        assert_eq!(FfiEdgeInterpolationAlgorithm::Karney as u32, 4);
     }
 
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest::rstest]
-    #[case(EdgeInterpolationAlgorithm::Spherical, "spherical")]
-    #[case(EdgeInterpolationAlgorithm::Vincenty, "vincenty")]
-    #[case(EdgeInterpolationAlgorithm::Thomas, "thomas")]
-    #[case(EdgeInterpolationAlgorithm::Andoyer, "andoyer")]
-    #[case(EdgeInterpolationAlgorithm::Karney, "karney")]
-    fn visit_schema_preserves_geography_algorithm_protocol_token(
+    #[case(
+        EdgeInterpolationAlgorithm::Spherical,
+        FfiEdgeInterpolationAlgorithm::Spherical
+    )]
+    #[case(
+        EdgeInterpolationAlgorithm::Vincenty,
+        FfiEdgeInterpolationAlgorithm::Vincenty
+    )]
+    #[case(
+        EdgeInterpolationAlgorithm::Thomas,
+        FfiEdgeInterpolationAlgorithm::Thomas
+    )]
+    #[case(
+        EdgeInterpolationAlgorithm::Andoyer,
+        FfiEdgeInterpolationAlgorithm::Andoyer
+    )]
+    #[case(
+        EdgeInterpolationAlgorithm::Karney,
+        FfiEdgeInterpolationAlgorithm::Karney
+    )]
+    fn edge_interpolation_algorithm_converts_in_both_directions(
+        #[case] kernel: EdgeInterpolationAlgorithm,
+        #[case] ffi: FfiEdgeInterpolationAlgorithm,
+    ) {
+        assert_eq!(FfiEdgeInterpolationAlgorithm::from(&kernel), ffi);
+        assert_eq!(EdgeInterpolationAlgorithm::from(ffi), kernel);
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest::rstest]
+    #[case(
+        EdgeInterpolationAlgorithm::Spherical,
+        FfiEdgeInterpolationAlgorithm::Spherical
+    )]
+    #[case(
+        EdgeInterpolationAlgorithm::Vincenty,
+        FfiEdgeInterpolationAlgorithm::Vincenty
+    )]
+    #[case(
+        EdgeInterpolationAlgorithm::Thomas,
+        FfiEdgeInterpolationAlgorithm::Thomas
+    )]
+    #[case(
+        EdgeInterpolationAlgorithm::Andoyer,
+        FfiEdgeInterpolationAlgorithm::Andoyer
+    )]
+    #[case(
+        EdgeInterpolationAlgorithm::Karney,
+        FfiEdgeInterpolationAlgorithm::Karney
+    )]
+    fn visit_schema_preserves_geography_algorithm(
         #[case] algorithm: EdgeInterpolationAlgorithm,
-        #[case] expected: &str,
+        #[case] expected: FfiEdgeInterpolationAlgorithm,
     ) {
         let schema = StructType::try_new(vec![StructField::not_null(
             "geog",
@@ -858,13 +966,15 @@ mod tests {
         let top_level_id = visit_schema_impl(&schema, &mut visitor);
 
         assert_eq!(top_level_id, 0);
-        assert_eq!(builder.lists[0].len(), 1);
         assert_eq!(
-            builder.lists[0][0]
-                .geo
-                .as_ref()
-                .and_then(|geo| geo.algorithm.as_deref()),
-            Some(expected)
+            builder.lists[0],
+            vec![VisitedField::geo(
+                "geog",
+                "geography",
+                false,
+                "OGC:CRS84",
+                Some(expected)
+            )]
         );
     }
 }

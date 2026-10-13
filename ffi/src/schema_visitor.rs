@@ -29,11 +29,13 @@ use delta_kernel::schema::{
     StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
-use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
+use delta_kernel::schema::{GeographyType, GeometryType};
 use delta_kernel::{KernelError, KernelResult, Result};
 use tracing::warn;
 
 use crate::scan::{CMetadataMap, CMetadataValueKind};
+#[cfg(feature = "geo-type-in-dev")]
+use crate::schema::FfiEdgeInterpolationAlgorithm;
 use crate::{
     AllocateErrorFn, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet,
     TryFromStringSlice,
@@ -573,28 +575,28 @@ fn visit_field_geometry_impl(
 /// Visit a geography field with the given coordinate reference system and edge interpolation
 /// algorithm.
 ///
-/// Returns an error if the field name, CRS, or algorithm is invalid UTF-8, if the CRS is not in
-/// `AUTHORITY:CODE` form, or if the algorithm is not a recognized Delta protocol token.
+/// Returns an error if the field name or CRS is invalid UTF-8, or if the CRS is not in
+/// `AUTHORITY:CODE` form.
 ///
 /// # Safety
 ///
-/// Caller is responsible for providing a valid `state`, valid `name`, `crs`, and `algorithm`
-/// slices, and `allocate_error` function pointer, all valid for the duration of this call. When
-/// non-null, `metadata` must point to a valid descriptor and callback.
+/// Caller is responsible for providing a valid `state`, valid `name` and `crs` slices, and
+/// `allocate_error` function pointer, all valid for the duration of this call. `algorithm` must
+/// hold one of the declared [`FfiEdgeInterpolationAlgorithm`] discriminants; any other value is
+/// undefined behavior. When non-null, `metadata` must point to a valid descriptor and callback.
 #[cfg(feature = "geo-type-in-dev")]
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_geography(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     crs: KernelStringSlice,
-    algorithm: KernelStringSlice,
+    algorithm: FfiEdgeInterpolationAlgorithm,
     nullable: bool,
     metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let crs = unsafe { TryFromStringSlice::try_from_slice(&crs) };
-    let algorithm = unsafe { TryFromStringSlice::try_from_slice(&algorithm) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_geography_impl(state, name_str, crs, algorithm, nullable, metadata)
         .into_extern_result(&allocate_error)
@@ -605,18 +607,11 @@ fn visit_field_geography_impl(
     state: &mut KernelSchemaVisitorState,
     name: Result<&str>,
     crs: Result<&str>,
-    algorithm: Result<&str>,
+    algorithm: FfiEdgeInterpolationAlgorithm,
     nullable: bool,
     metadata: Result<HashMap<String, MetadataValue>>,
 ) -> Result<usize> {
-    let algorithm = algorithm?
-        .parse::<EdgeInterpolationAlgorithm>()
-        .map_err(|err| {
-            KernelError::invalid_geo_params(format!(
-                "Invalid geography edge interpolation algorithm: {err}"
-            ))
-        })?;
-    let geography = GeographyType::try_new(crs?, algorithm)?;
+    let geography = GeographyType::try_new(crs?, algorithm.into())?;
     visit_field_primitive_impl(
         state,
         name,
@@ -909,6 +904,8 @@ mod tests {
     use std::ffi::c_void;
     use std::ptr::{null, NonNull};
 
+    #[cfg(feature = "geo-type-in-dev")]
+    use delta_kernel::schema::EdgeInterpolationAlgorithm;
     use delta_kernel::schema::{DataType, MetadataValue, PrimitiveType};
     use rstest::rstest;
 
@@ -1474,7 +1471,7 @@ mod tests {
                 geography,
                 "geography",
                 KernelStringSlice::new_unsafe("OGC:CRS84"),
-                KernelStringSlice::new_unsafe("spherical")
+                FfiEdgeInterpolationAlgorithm::Spherical
             );
         }
     }
@@ -1482,12 +1479,11 @@ mod tests {
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
     #[case::bad_geometry_crs("geom", "EPSG:4326 ", None)]
-    #[case::bad_geography_crs("geog", "EPSG:4326 ", Some("spherical"))]
-    #[case::bad_geography_algorithm("geog", "OGC:CRS84", Some("not-an-algorithm"))]
+    #[case::bad_geography_crs("geog", "EPSG:4326 ", Some(FfiEdgeInterpolationAlgorithm::Spherical))]
     fn invalid_geo_field_parameters_return_recoverable_errors_without_inserting_fields(
         #[case] name: &str,
         #[case] crs: &str,
-        #[case] algorithm: Option<&str>,
+        #[case] algorithm: Option<FfiEdgeInterpolationAlgorithm>,
     ) {
         let mut state = KernelSchemaVisitorState::default();
         let result = match algorithm {
@@ -1506,7 +1502,7 @@ mod tests {
                     &mut state,
                     KernelStringSlice::new_unsafe(name),
                     KernelStringSlice::new_unsafe(crs),
-                    KernelStringSlice::new_unsafe(algorithm),
+                    algorithm,
                     true,
                     null(),
                     allocate_err,
@@ -1530,8 +1526,8 @@ mod tests {
             visit_field_geography(
                 &mut state,
                 KernelStringSlice::new_unsafe("geog"),
-                KernelStringSlice::new_unsafe("OGC:CRS84"),
-                KernelStringSlice::new_unsafe("not-an-algorithm"),
+                KernelStringSlice::new_unsafe("EPSG:4326 "),
+                FfiEdgeInterpolationAlgorithm::Spherical,
                 true,
                 null(),
                 allocate_err,
@@ -1549,12 +1545,58 @@ mod tests {
             state,
             "geog",
             KernelStringSlice::new_unsafe("OGC:CRS84"),
-            KernelStringSlice::new_unsafe("spherical"),
+            FfiEdgeInterpolationAlgorithm::Spherical,
             true,
             null()
         );
         let field = unwrap_field(&mut state, valid).unwrap();
         assert_eq!(field.name(), "geog");
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case(
+        FfiEdgeInterpolationAlgorithm::Spherical,
+        EdgeInterpolationAlgorithm::Spherical
+    )]
+    #[case(
+        FfiEdgeInterpolationAlgorithm::Vincenty,
+        EdgeInterpolationAlgorithm::Vincenty
+    )]
+    #[case(
+        FfiEdgeInterpolationAlgorithm::Thomas,
+        EdgeInterpolationAlgorithm::Thomas
+    )]
+    #[case(
+        FfiEdgeInterpolationAlgorithm::Andoyer,
+        EdgeInterpolationAlgorithm::Andoyer
+    )]
+    #[case(
+        FfiEdgeInterpolationAlgorithm::Karney,
+        EdgeInterpolationAlgorithm::Karney
+    )]
+    fn visit_field_geography_builds_each_algorithm(
+        #[case] algorithm: FfiEdgeInterpolationAlgorithm,
+        #[case] expected: EdgeInterpolationAlgorithm,
+    ) {
+        let mut state = KernelSchemaVisitorState::default();
+        let field_id = visit_field!(
+            geography,
+            state,
+            "geog",
+            KernelStringSlice::new_unsafe("OGC:CRS84"),
+            algorithm,
+            false,
+            null()
+        );
+        let field = unwrap_field(&mut state, field_id).unwrap();
+
+        let DataType::Primitive(PrimitiveType::Geography(geography)) = field.data_type() else {
+            panic!("Field geog is not a geography type");
+        };
+        assert_eq!(geography.crs(), "OGC:CRS84");
+        assert_eq!(geography.algorithm(), &expected);
+        assert!(!field.is_nullable());
     }
 
     #[test]
@@ -1888,7 +1930,7 @@ mod tests {
             state,
             "col_geography",
             KernelStringSlice::new_unsafe("OGC:CRS84"),
-            KernelStringSlice::new_unsafe("spherical"),
+            FfiEdgeInterpolationAlgorithm::Spherical,
             false,
             null()
         );
@@ -2022,7 +2064,10 @@ mod tests {
                 panic!("Field col_geography is not a geography type");
             };
             assert_eq!(geography_type.crs(), "OGC:CRS84");
-            assert_eq!(geography_type.algorithm().to_string(), "spherical");
+            assert_eq!(
+                geography_type.algorithm(),
+                &EdgeInterpolationAlgorithm::Spherical
+            );
         }
     }
 
